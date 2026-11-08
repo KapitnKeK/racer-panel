@@ -5,8 +5,8 @@ keine Inhalte nötig), liefert über die offizielle Overlay-Schnittstelle Daten 
 „Regie" fernsteuern (Kamera/Fahrer). Das Bild wird per NVENC gestreamt. Siehe
 [sector3studios/r3e-spectator-overlay](https://github.com/sector3studios/r3e-spectator-overlay).
 
-**Stand:** Steam läuft headless auf einer Tesla P100 in einem Proxmox-LXC (Debian 13). Ob RaceRoom selbst unter
-Proton auf dieser Karte läuft, ist noch nicht getestet.
+**Stand:** RaceRoom läuft headless auf einer Tesla P100 in einem Proxmox-LXC (Debian 13, Proton Experimental,
+1920×1080, ~2 GB VRAM im Menü). Zuschauer-Beitritt, Datenbrücke und Stream sind in Arbeit.
 
 ## Was funktioniert hat
 | Baustein | Ergebnis |
@@ -15,6 +15,27 @@ Proton auf dieser Karte läuft, ist noch nicht getestet.
 | NVENC (`ffmpeg -c:v h264_nvenc`, `x11grab`) | funktioniert |
 | Steam-Oberfläche | erst mit `SDL_VIDEO_X11_XRANDR=0` (siehe `steam-wrapper.sh`) |
 | Xvfb + NVIDIA-Vulkan | **geht nicht** (Absturz beim Präsentieren) |
+| RaceRoom unter Proton | läuft, **nach** CPU-Fix (unten) |
+
+## Wichtigster Stolperstein: CPU-Zuweisung im LXC
+RaceRoom bricht beim Start mit `Fatal Error … SystemManager::WorkaroundForDifferentProcessors … Error Code: 87`
+(davor evtl. `Internal error 0xE200000C`) ab. Ursache: Proxmox gibt dem Container lückenhafte Kerne (z. B.
+`Cpus_allowed_list: 7-10,12-13`), lxcfs zeigt aber 6 CPUs mit den Nummern 0–5. Wine legt Threads auf „CPU 0–5“ →
+`EINVAL`. Auch `WINE_CPU_TOPOLOGY` scheitert dann („Invalid WINE_CPU_TOPOLOGY string“). `-nothreadaffinity` allein
+reicht nicht.
+
+**Lösung:** dem Container zusammenhängende Kerne ab 0 geben:
+```
+# /etc/pve/lxc/<id>.conf
+lxc.cgroup2.cpuset.cpus: 0-5
+```
+Zusätzlich als Steam-Startoption: `/usr/local/bin/r3e-launch %command% -nothreadaffinity`
+(`r3e-launch.sh` setzt `WINE_CPU_TOPOLOGY` passend zu den erlaubten Kernen und schaltet das Proton-Log ein).
+
+## Weitere Hinweise
+- Steams Shader-Vorberechnung („Processing Vulkan shaders“) kann sehr lange laufen → „Skip“.
+- Beim Start fragt Steam nach der Startvariante („Play RaceRoom“) und zeigt einen Controller-Hinweis.
+- Startoptionen ohne Oberfläche setzen: `userdata/<id>/config/localconfig.vdf` → `apps/211500/LaunchOptions` (Steam vorher beenden).
 
 ## Einrichtung (Kurzfassung)
 1. **Host (Proxmox):** NVIDIA-Treiber mit Kernelmodul; zusätzlich `modprobe nvidia-modeset && nvidia-modprobe -m`
