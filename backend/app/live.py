@@ -52,6 +52,9 @@ class Live:
         self.classes: dict[int, str] = {}
         self.layouts: dict[int, tuple[str, str]] = {}
         self.delta: dict[int, dict] = {}
+        self.bot: dict[str, Any] = {"ts": 0}
+        self.bot_cmd: Optional[dict] = None
+        self.bot_events: deque = deque(maxlen=50)
         self.visits: dict[tuple[int, int], dict] = {}
         self.visit_done: list[dict] = []
         self.stats = {"polls": 0, "errors": 0, "cells_written": 0}
@@ -67,6 +70,8 @@ class Live:
             c.execute("CREATE TABLE IF NOT EXISTS driver_tracks(user_id INTEGER, layout_id INTEGER, seconds REAL DEFAULT 0, meters REAL DEFAULT 0, top_kmh REAL DEFAULT 0, PRIMARY KEY(user_id,layout_id))")
             c.execute("CREATE TABLE IF NOT EXISTS driver_visits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, server_name TEXT, layout_id INTEGER, car TEXT, start INTEGER, end INTEGER, seconds REAL, meters REAL, top_kmh REAL, incident_points INTEGER)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_visits_user ON driver_visits(user_id, start)")
+            c.execute("CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS bot_results(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, data TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS geo_attempts(track_id INTEGER PRIMARY KEY, cells INTEGER, ts INTEGER, ok INTEGER, note TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS driver_cache(id INTEGER PRIMARY KEY, data TEXT NOT NULL, ts INTEGER NOT NULL)")
             for row in c.execute("SELECT id,data FROM driver_cache"):
@@ -320,6 +325,27 @@ class Live:
             except Exception:
                 pass
 
+    # ------------------------------------------------------- Zuschauer-Bot
+    def bot_view(self) -> Optional[dict]:
+        b = self.bot
+        if not b.get("ts") or time.time() - b["ts"] > 15:
+            return {"connected": False, "last_seen": b.get("ts") or None} if b.get("ts") else None
+        drivers = []
+        for x in b.get("drivers") or []:
+            si = x.get("scoreInfo") or {}
+            best = si.get("bestLapInfo") or {}
+            secs = [best.get("sector1", -1), best.get("sector2", -1), best.get("sector3", -1)]
+            best_ms = secs[2] if secs[2] and secs[2] > 0 else None  # sector3 = kumulierte Rundenzeit
+            drivers.append({
+                "slot": x.get("slotId"), "user_id": x.get("portalId"), "name": x.get("name"), "class_id": x.get("classId"),
+                "pos": si.get("positionOverall"), "pos_class": si.get("positionClass"), "laps": si.get("laps"),
+                "current_ms": si.get("currentLapTime"), "best_ms": best_ms, "best_valid": best.get("valid"),
+                "gap_ms": si.get("timeDiff"), "gap_laps": si.get("lapDiff"), "distance": si.get("distanceTravelled"),
+                "flags": si.get("flagInfo") or {},
+            })
+        drivers.sort(key=lambda d: (d["pos"] if isinstance(d["pos"], int) and d["pos"] > 0 else 999))
+        return {"connected": True, "session": b.get("session"), "event": b.get("event"), "drivers": drivers, "events": list(self.bot_events)[-15:]}
+
     # ------------------------------------------------------- Fahrer-Statistik
     def _acc(self, uid: int, sid: int, gs: dict, layout_id: Optional[int], p: dict, kmh: float, car: Optional[dict], dt: float, dist: float, inc_pts: int) -> None:
         now = int(time.time())
@@ -464,6 +490,7 @@ class Live:
                     delta, self.delta = self.delta, {}
                     done, self.visit_done = self.visit_done, []
                     await asyncio.to_thread(self._flush_stats, delta, done)
+                snap["bot"] = self.bot_view()
                 self.snapshot = snap
                 any_players = any(s["state"]["players"] for s in snap["servers"])
                 delay = 0.5 if any_players else 1.5
@@ -508,6 +535,16 @@ class MotdIn(BaseModel):
 
 class WhitelistIn(BaseModel):
     users: list[int] = Field(default_factory=list, max_length=200)
+
+
+class CameraIn(BaseModel):
+    slot: int = Field(..., ge=0, le=128)
+    camera: Literal["cockpit", "onboard", "onboard1", "onboard2", "nosecam", "swingman", "trackside", "frontCam", "rearCam", "wing", "exhaust"]
+
+
+class BotCfgIn(BaseModel):
+    hls_url: str = Field("", max_length=200)
+    rotate: bool = False
 
 
 class AutoIn(BaseModel):
@@ -645,6 +682,98 @@ def setup(app, d: dict[str, Callable]) -> Live:
                     "profile_url": f"https://game.raceroom.com/users/{info['username']}" if info.get("username") else None,
                     "banner": info.get("banner")})
         return out
+
+    def _kv(key: str, default: Optional[str] = None) -> Optional[str]:
+        with d["db"]() as c:
+            row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def _kv_set(key: str, value: str) -> None:
+        with d["db"]() as c:
+            c.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def _bot_token() -> str:
+        t = _kv("bot_token")
+        if not t:
+            import secrets as _s
+            t = _s.token_urlsafe(24)
+            _kv_set("bot_token", t)
+        return t
+
+    def _check_bot(request: Request) -> None:
+        import hmac as _h
+        if not _h.compare_digest(request.headers.get("x-bot-token", ""), _bot_token()):
+            raise HTTPException(403, "Falscher Bot-Token")
+
+    _BC_DIR = __import__("pathlib").Path(__file__).with_name("broadcast")
+
+    @r.get("/broadcast/")
+    @r.get("/broadcast/{name}")
+    def broadcast_file(name: str = "index.html"):
+        from fastapi.responses import FileResponse
+        if name not in ("index.html", "r3e.js", "bridge.js"):
+            raise HTTPException(404, "Nicht gefunden")
+        return FileResponse(_BC_DIR / name, headers={"Cache-Control": "no-cache"})
+
+    @r.post("/api/bot/ingest")
+    async def bot_ingest(request: Request):
+        _check_bot(request)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(422, "Ungültig")
+        hub.bot = {"ts": time.time(), "drivers": (body.get("drivers") or [])[:64], "session": body.get("session"), "event": body.get("event")}
+        cmd, hub.bot_cmd = hub.bot_cmd, None
+        return {"ok": True, "command": cmd}
+
+    @r.post("/api/bot/event")
+    async def bot_event(request: Request):
+        _check_bot(request)
+        e = await request.json()
+        if isinstance(e, dict):
+            hub.bot_events.append({"ts": time.time(), **{k: e.get(k) for k in ("slotId", "type", "reason")}})
+        return {"ok": True}
+
+    @r.post("/api/bot/results")
+    async def bot_results(request: Request):
+        _check_bot(request)
+        res = await request.json()
+        with d["db"]() as c:
+            c.execute("INSERT INTO bot_results(ts,data) VALUES(?,?)", (int(time.time()), json.dumps(res)[:500000]))
+        return {"ok": True}
+
+    @r.post("/api/bot/camera")
+    def bot_camera(body: CameraIn, user=Depends(require("host"))):
+        hub.bot_cmd = {"slotId": body.slot, "camera": body.camera}
+        return {"ok": True}
+
+    @r.get("/api/bot/config")
+    def bot_config(_=Depends(require("admin"))):
+        return {"token": _bot_token(), "hls_url": _kv("bot_hls_url", "")}
+
+    @r.put("/api/bot/config")
+    def bot_config_set(body: BotCfgIn, user=Depends(require("admin"))):
+        u = body.hls_url.strip().rstrip("/")
+        if u and not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?(/[A-Za-z0-9._\-/]*)?$", u):
+            raise HTTPException(422, "Ungültige Stream-Adresse")
+        _kv_set("bot_hls_url", u)
+        if body.rotate:
+            _kv_set("bot_token", "")
+        audit(user.username, "bot.config", "token neu" if body.rotate else "hls")
+        return {"ok": True, "token": _bot_token()}
+
+    @r.get("/api/bot/hls/{name}")
+    async def bot_hls(name: str, _=Depends(require("viewer"))):
+        base = _kv("bot_hls_url", "")
+        if not base or not re.match(r"^[A-Za-z0-9_.\-]{1,80}$", name) or not name.endswith((".m3u8", ".ts", ".m4s", ".mp4")):
+            raise HTTPException(404, "Kein Stream")
+        try:
+            rr = await hub.web.get(f"{base}/{name}", timeout=8.0)
+        except Exception:
+            raise HTTPException(502, "Stream nicht erreichbar")
+        if rr.status_code != 200:
+            raise HTTPException(404, "Kein Stream")
+        mt = "application/vnd.apple.mpegurl" if name.endswith(".m3u8") else ("video/mp2t" if name.endswith(".ts") else "video/mp4")
+        return Response(rr.content, media_type=mt, headers={"Cache-Control": "no-cache" if name.endswith(".m3u8") else "max-age=60"})
 
     @r.delete("/api/tracks/{layout_id}/outline")
     def outline_reset(layout_id: int, user=Depends(require("admin"))):

@@ -484,7 +484,7 @@ init_db()
 
 CSP = (
     "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
-    "connect-src 'self'; font-src 'self'; frame-src https://player.twitch.tv https://www.youtube-nocookie.com; "
+    "connect-src 'self'; font-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; frame-src https://player.twitch.tv https://www.youtube-nocookie.com; "
     "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
 )
 

@@ -9,6 +9,7 @@ import Drivers, { Avatar } from '../components/Drivers'
 import SpeedChart from '../components/SpeedChart'
 import { Chat, EventFeed } from '../components/Feed'
 import Editor from './Editor'
+import { BotSetup, BotStandings, BotVideo } from '../components/Bot'
 import { Badge, Card, Confirm, Empty, Field, Spinner, useAsync, useToast } from '../components/ui'
 import { INCIDENT_TYPES, driverColor, fmtClock, flagEmoji, liveryImg } from '../utils'
 
@@ -130,6 +131,8 @@ function ControlTab({ server, names, isAdmin, stream, setStream }) {
         <button className="btn-primary mt-3" disabled={busy || !idsOk} onClick={() => run(() => api(`/api/servers/${server.id}/whitelist`, { method: 'PUT', body: { users: parseIds() } }), 'Whitelist gespeichert')}>{busy ? <Spinner /> : <Save size={15} />} Speichern</button>
       </Card>
 
+      {isAdmin && <BotSetup />}
+
       <Card title="Sperrliste" right={<Ban size={16} className="text-ink-400" />} className="lg:col-span-2">
         {bans.length === 0 ? <p className="text-sm text-ink-300">Es ist niemand gesperrt.</p> : (
           <ul className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -235,11 +238,13 @@ export default function ServerPage() {
                 <TrackMap layoutId={server.layout_id} players={players} names={names} hist={hist} serverId={sid} selected={sel} onSelect={setSel} reportMs={server.state_report_ms} />
               </div>
             </Card>
+            <BotStandings bot={snap.bot} names={names} canHost={canHost} />
             <Card title={`Fahrer${st.running ? ` (${online})` : ''}`} pad={false}>
               <Drivers server={server} names={names} selected={sel} onSelect={setSel} canHost={canHost} isAdmin={isAdmin} />
             </Card>
           </div>
           <div className="min-w-0 space-y-5">
+            {snap.bot?.connected && <BotVideo />}
             {stream && <Card title="Live-Stream" right={<Badge tone="red" dot>Stream</Badge>}><StreamEmbed stream={stream} /></Card>}
             <Card title="Ausgewählter Fahrer">
               {selPlayer

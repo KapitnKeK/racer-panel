@@ -49,3 +49,14 @@ Zusätzlich als Steam-Startoption: `/usr/local/bin/r3e-launch %command% -nothrea
 4. Benutzer `bot`, `/run/user/<uid>` per tmpfiles anlegen (sonst „g_mkdtemp: Keine Berechtigung"),
    `xorg.conf`, `systemd/*.service`, `steam-wrapper.sh` → `/usr/local/bin/steam`.
 5. Über noVNC (`http://<ip>:6080/vnc.html`) bei Steam anmelden, Proton aktivieren, RaceRoom installieren.
+
+## Datenbrücke und Stream (im Panel eingebaut)
+- **Zuschauer-Seite:** `<panel>/broadcast/?t=<token>` (Token unter *Steuerung → Zuschauer-Bot*). Als Steam-Startoption:
+  `/usr/local/bin/r3e-launch %command% -nothreadaffinity -broadcastUrl=http://<panel-ip>:8180/broadcast/?t=<token>`.
+  Die Seite nutzt die offizielle `r3e.js` (Unlicense) und schickt jede Sekunde Fahrer-, Session- und Event-Daten an
+  `/api/bot/ingest`; Kamerabefehle aus dem Panel kommen in der Antwort zurück (`r3e.setCamera.<typ>({slotId})`).
+- **Video:** `systemd/r3e-stream.service` nimmt `:0` per `x11grab` auf, kodiert mit `h264_nvenc` (720p, 4 Mbit/s) und
+  schreibt HLS nach `/var/www/hls`; `nginx-hls.conf` liefert das nur ins LAN. Das Panel reicht den Stream unter
+  `/api/bot/hls/stream.m3u8` nur an angemeldete Benutzer durch (Adresse unter *Steuerung → Zuschauer-Bot* eintragen).
+- **Offen:** Beim allerersten Start verlangt RaceRoom ein ausgefülltes Profil (Land) im Spiel; danach Mehrspieler →
+  Server wählen → als Zuschauer beitreten. Ob die Sektorzeiten der Overlay-API kumuliert sind, ist noch zu prüfen.
