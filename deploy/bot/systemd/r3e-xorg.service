@@ -1,0 +1,8 @@
+[Unit]
+Description=Unsichtbarer X-Server auf der NVIDIA-Karte (:0)
+After=network.target
+[Service]
+ExecStart=/usr/lib/xorg/Xorg :0 -config /etc/X11/xorg.conf -nolisten tcp -noreset -novtswitch -sharevts vt7
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

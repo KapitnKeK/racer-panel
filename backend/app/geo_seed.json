@@ -1,0 +1,15 @@
+{
+ "8366": {
+  "lat0": 29.1902572,
+  "lon0": -81.0734869,
+  "rot_deg": 0.081,
+  "mirror": false,
+  "source": "OSM-Ausrichtung am gefahrenen Road Course 2026-11-08 (Median 3.3 m, 90% 10 m)",
+  "view": [
+   -441,
+   -1596,
+   1362,
+   438
+  ]
+ }
+}

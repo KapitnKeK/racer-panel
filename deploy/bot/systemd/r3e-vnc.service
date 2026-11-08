@@ -1,0 +1,11 @@
+[Unit]
+Description=x11vnc fuer :0 (nur localhost, Zugriff ueber noVNC)
+After=r3e-xorg.service
+Requires=r3e-xorg.service
+[Service]
+User=bot
+ExecStartPre=/bin/sleep 4
+ExecStart=/usr/bin/x11vnc -display :0 -forever -shared -localhost -rfbport 5900 -rfbauth /home/bot/.vnc/passwd -quiet
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

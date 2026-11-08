@@ -1,0 +1,12 @@
+[Unit]
+Description=Openbox-Desktop fuer den Bot-Benutzer
+After=r3e-xorg.service
+Requires=r3e-xorg.service
+[Service]
+User=bot
+Environment=DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 LANG=de_DE.UTF-8 SDL_VIDEO_X11_XRANDR=0
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/openbox-session
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

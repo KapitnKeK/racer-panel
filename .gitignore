@@ -1,0 +1,16 @@
+node_modules/
+frontend/dist/
+.venv/
+__pycache__/
+*.pyc
+data/
+data-*/
+*.sqlite
+*.sqlite-*
+secret.key
+deploy/windows/build/
+tools/shot/out/
+tools/geo/*.json
+!backend/app/geo_seed.json
+.env
+.env.*
