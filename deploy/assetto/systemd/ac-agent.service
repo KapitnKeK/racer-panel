@@ -1,0 +1,12 @@
+[Unit]
+Description=Racer-Panel-Agent fuer Assetto Corsa
+After=network-online.target
+
+[Service]
+EnvironmentFile=/etc/ac-agent.env
+ExecStart=/usr/bin/python3 /opt/assettoserver/agent.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

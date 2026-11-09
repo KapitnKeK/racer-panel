@@ -13,7 +13,7 @@ export function Logo({ size = 'md' }) {
         <svg viewBox="0 0 32 32" className={big ? 'h-7 w-7' : 'h-5 w-5'}><path d="M9 25 17 7h6l-8 18z" fill="white" /></svg>
       </span>
       <span className={`font-display font-bold uppercase leading-none tracking-[0.12em] ${big ? 'text-3xl' : 'text-xl'}`}>
-        Race<span className="text-accent-hi">Room</span> <span className="text-ink-300">Panel</span>
+        Racer<span className="text-accent-hi">.</span> <span className="text-ink-300">Panel</span>
       </span>
     </div>
   )
@@ -37,7 +37,7 @@ export default function Layout() {
             {can(user, 'admin') && <NavLink to="/log" className={link}><ScrollText size={15} /> Verlauf</NavLink>}
           </nav>
           <div className="ml-auto flex items-center gap-3">
-            {managerDown ? <Badge tone="red" dot>Manager offline</Badge> : connected ? <Badge tone="green" dot>Live</Badge> : <Badge tone="amber" dot>Verbinde…</Badge>}
+            {managerDown ? <Badge tone="red" dot>Spiel-Host offline</Badge> : connected ? <Badge tone="green" dot>Live</Badge> : <Badge tone="amber" dot>Verbinde…</Badge>}
             <div className="hidden items-center gap-2 text-sm sm:flex">
               <span className="font-medium">{user.username}</span>
               <Badge tone={user.role === 'admin' ? 'red' : 'gray'}>{ROLE_LABEL[user.role]}</Badge>

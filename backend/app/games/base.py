@@ -74,7 +74,7 @@ class GameAdapter:
         """{layout_id: (Strecke, Layout)}"""
         return {}
 
-    def settings_schema(self) -> list[dict]:
+    async def settings_schema(self) -> list[dict]:
         """Feldbeschreibung für den generischen Editor (nur bei editor == "schema")."""
         return []
 

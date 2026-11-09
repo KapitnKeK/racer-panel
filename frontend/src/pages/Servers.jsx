@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Activity, Clock, Lock, MapPin, Pencil, Play, Plus, Radio, Server, Square, Trash2, Users } from 'lucide-react'
 import { api, can } from '../api'
 import { useAuth } from '../auth'
 import { useLive } from '../live'
+import { GameBadge, hasCap, useGames } from '../games'
 import { Avatar } from '../components/Drivers'
 import { Badge, Confirm, Empty, Spinner, useAsync } from '../components/ui'
 import { fmtClock, thumbSrc } from '../utils'
@@ -46,6 +47,7 @@ function ServerCard({ s, names, canHost, isAdmin }) {
           <div className="flex items-start justify-between gap-3">
             <h3 className="min-w-0 truncate font-display text-2xl font-semibold tracking-wide">{s.name}</h3>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+              <GameBadge game={s.game} />
               {s.has_password && <span title="Mit Passwort geschützt" className="text-ink-300"><Lock size={14} /></span>}
               {st.running ? <Badge tone="green" dot>Läuft</Badge> : <Badge tone="gray">Gestoppt</Badge>}
             </div>
@@ -82,11 +84,11 @@ function ServerCard({ s, names, canHost, isAdmin }) {
 
         <footer className="mt-auto flex flex-wrap gap-2 pt-1">
           <Link to={`/server/${s.id}`} className="btn-ghost flex-1"><Radio size={15} /> {st.running ? 'Live ansehen' : 'Details'}</Link>
-          {canHost && (st.running
+          {canHost && hasCap(s, 'start') && (st.running
             ? <button className="btn-danger" disabled={busy} onClick={() => (online ? setConfirm('stop') : stop())}>{busy ? <Spinner /> : <Square size={14} />} Stopp</button>
             : <button className="btn-ok" disabled={busy} onClick={start}>{busy ? <Spinner /> : <Play size={14} />} Start</button>)}
-          {canHost && <Link to={`/server/${s.id}?tab=settings`} className="btn-ghost !px-2.5" title="Einstellungen"><Pencil size={15} /></Link>}
-          {isAdmin && !st.running && <button className="btn-ghost !px-2.5 hover:!border-accent/60 hover:!text-red-300" title="Löschen" onClick={() => setConfirm('delete')}><Trash2 size={15} /></button>}
+          {canHost && hasCap(s, 'edit') && <Link to={`/server/${s.id}?tab=settings`} className="btn-ghost !px-2.5" title="Einstellungen"><Pencil size={15} /></Link>}
+          {isAdmin && hasCap(s, 'delete') && !st.running && <button className="btn-ghost !px-2.5 hover:!border-accent/60 hover:!text-red-300" title="Löschen" onClick={() => setConfirm('delete')}><Trash2 size={15} /></button>}
         </footer>
       </div>
       <Confirm open={confirm === 'stop'} danger title="Server stoppen?" confirmLabel="Stoppen" busy={busy} onClose={() => setConfirm(null)} onConfirm={stop}
@@ -102,7 +104,10 @@ export default function Servers() {
   const { user } = useAuth()
   const canHost = can(user, 'host')
   const names = snap?.names || {}
-  const list = snap?.servers
+  const { games } = useGames()
+  const [filter, setFilter] = useState('all')
+  const all = snap?.servers
+  const list = useMemo(() => (all ? all.filter((s) => filter === 'all' || s.game === filter) : all), [all, filter])
 
   if (!snap) return <div className="grid place-items-center py-24"><Spinner className="text-accent" /></div>
   const running = list.filter((s) => s.state.running).length
@@ -113,10 +118,16 @@ export default function Servers() {
       <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-4xl font-bold uppercase tracking-wider">Server</h1>
-          <p className="mt-1 text-sm text-ink-300">Alle RaceRoom-Server auf einen Blick, live aktualisiert.</p>
+          <p className="mt-1 text-sm text-ink-300">Alle Rennspiel-Server auf einen Blick, live aktualisiert.</p>
         </div>
         {canHost && <Link to="/server/new" className="btn-primary"><Plus size={16} /> Neuer Server</Link>}
       </div>
+
+      {games.length > 1 && (
+        <div className="mb-4 flex flex-wrap gap-1.5">
+          {[{ key: 'all', name: 'Alle' }, ...games].map((g) => <button key={g.key} className={`btn-sm ${filter === g.key ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setFilter(g.key)}>{g.name}</button>)}
+        </div>
+      )}
 
       <div className="mb-6 grid gap-3 sm:grid-cols-3">
         <Stat icon={Server} label="Server" value={list.length} />
@@ -126,7 +137,7 @@ export default function Servers() {
 
       {snap.manager_ok === false && (
         <div className="mb-5 rounded-lg border border-accent/40 bg-accent-soft px-4 py-3 text-sm text-red-300">
-          Der RaceRoom-Manager auf der VM antwortet nicht. Die Anzeige zeigt den letzten bekannten Stand.
+          Ein Spiel-Host antwortet nicht. Die Anzeige zeigt den letzten bekannten Stand.
         </div>
       )}
 

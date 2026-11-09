@@ -18,7 +18,7 @@ export async function api(path, { method = 'GET', body } = {}) {
     res = await fetch(path, {
       method,
       credentials: 'same-origin',
-      headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), 'X-Requested-With': 'r3e-panel' },
+      headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), 'X-Requested-With': 'racer-panel' },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     })
   } catch {

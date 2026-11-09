@@ -1,14 +1,23 @@
-# RaceRoom Panel
+# Racer Panel
 
-Selbst gehostetes Web-Panel für den **RaceRoom Racing Experience Dedicated Server**: Server starten, stoppen und
-komplett konfigurieren, Fahrer live auf einer Streckenkarte (bei echten Strecken auf dem Satellitenbild) verfolgen,
-Chat, Strafen, Kick/Ban, Fahrer-Statistik, Rollen für Freunde.
+Selbst gehostetes Web-Panel für **Rennspiel-Server**, ein Login für alles: Server starten, stoppen und konfigurieren,
+Fahrer live auf einer Streckenkarte (bei echten Strecken auf dem Satellitenbild), Chat, Strafen, Kick/Ban,
+Fahrer-Statistik, Zuschauer-Kamera mit Live-Video, Rollen für Freunde. Weitere Spiele kommen über **Plugins** dazu.
 
-*Self-hosted web panel for the RaceRoom Racing Experience dedicated server: control and configure servers, follow
-drivers live on a (satellite) track map, chat, penalties, driver statistics, role-based access for friends.
-UI language: German.*
+*Self-hosted web panel for racing-game servers (one login for all): control and configure servers, follow drivers live on a
+(satellite) track map, chat, penalties, statistics, spectator camera with live video, role-based access.
+Games are plugins. UI language: German.*
 
-> Inoffizielles Hobbyprojekt, nicht mit KW Studios / Sector3 Studios verbunden. „RaceRoom" ist eine Marke der jeweiligen Rechteinhaber.
+## Unterstützte Spiele
+| Spiel | Stand |
+|---|---|
+| **RaceRoom Racing Experience** | vollständig: Verwaltung, Live-Karte, Statistik, Steuerung, Zuschauer-Bot mit Kamera/Video/Ton |
+| **Assetto Corsa** (AssettoServer) | Anlegen, Bearbeiten, Starten, Stoppen über einen Agenten ([deploy/assetto](deploy/assetto)); Live-Daten folgen. Echter Serverstart noch ungeprüft |
+| weitere | [Neues Spiel hinzufügen](docs/NEUES-SPIEL.md) (Vorlage: `backend/app/games/_template`) |
+
+iRacing lässt sich nicht selbst hosten (Server laufen ausschließlich bei iRacing).
+
+> Inoffizielles Hobbyprojekt, nicht mit KW Studios / Sector3 Studios, Kunos Simulazioni oder anderen Spieleherstellern verbunden. Spielnamen sind Marken der jeweiligen Rechteinhaber.
 
 ![Live-Ansicht (Demo mit simulierten Fahrern)](docs/img/live-demo.png)
 

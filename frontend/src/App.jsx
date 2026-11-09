@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { api, can } from './api'
 import { AuthCtx } from './auth'
 import { LiveProvider } from './live'
+import { GamesProvider } from './games'
 import Layout from './components/Layout'
 import { Spinner } from './components/ui'
 import Login from './pages/Login'
@@ -32,7 +33,7 @@ export default function App() {
 
   return (
     <AuthCtx.Provider value={{ user, logout }}>
-      <LiveProvider onUnauthorized={expired}>
+      <GamesProvider><LiveProvider onUnauthorized={expired}>
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Servers />} />
@@ -45,7 +46,7 @@ export default function App() {
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
-      </LiveProvider>
+      </LiveProvider></GamesProvider>
     </AuthCtx.Provider>
   )
 }

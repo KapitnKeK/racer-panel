@@ -28,6 +28,7 @@ function Avatar({ info, uid, size = 32 }) {
 export { Avatar }
 
 export default function Drivers({ server, names, selected, onSelect, canHost, isAdmin }) {
+  const can_ = (c) => !server.caps || server.caps.includes(c)
   const players = server.state.players
   const [penaltyFor, setPenaltyFor] = useState(null)
   const [kickFor, setKickFor] = useState(null)
@@ -73,9 +74,9 @@ export default function Drivers({ server, names, selected, onSelect, canHost, is
               </div>
               {canHost && (
                 <div className="mt-2.5 flex justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
-                  <button className="btn-ghost btn-sm" onClick={() => setPenaltyFor(p.user_id)}><Gavel size={14} /> Strafe</button>
-                  <button className="btn-ghost btn-sm" onClick={() => setKickFor(p.user_id)}><LogOut size={14} /> Kick</button>
-                  {isAdmin && <button className="btn-danger btn-sm" onClick={() => setBanFor(p.user_id)}><Ban size={14} /> Ban</button>}
+                  {can_('penalty') && <button className="btn-ghost btn-sm" onClick={() => setPenaltyFor(p.user_id)}><Gavel size={14} /> Strafe</button>}
+                  {can_('kick') && <button className="btn-ghost btn-sm" onClick={() => setKickFor(p.user_id)}><LogOut size={14} /> Kick</button>}
+                  {isAdmin && can_('ban') && <button className="btn-danger btn-sm" onClick={() => setBanFor(p.user_id)}><Ban size={14} /> Ban</button>}
                 </div>
               )}
             </li>
@@ -139,9 +140,9 @@ export default function Drivers({ server, names, selected, onSelect, canHost, is
                   {canHost && (
                     <td className="td text-right" onClick={(e) => e.stopPropagation()}>
                       <div className="inline-flex gap-1">
-                        <button className="btn-ghost btn-sm !px-2" title="Strafe verhängen" onClick={() => setPenaltyFor(p.user_id)}><Gavel size={14} /></button>
-                        <button className="btn-ghost btn-sm !px-2" title="Vom Server werfen" onClick={() => setKickFor(p.user_id)}><LogOut size={14} /></button>
-                        {isAdmin && <button className="btn-danger btn-sm !px-2" title="Dauerhaft sperren" onClick={() => setBanFor(p.user_id)}><Ban size={14} /></button>}
+                        {can_('penalty') && <button className="btn-ghost btn-sm !px-2" title="Strafe verhängen" onClick={() => setPenaltyFor(p.user_id)}><Gavel size={14} /></button>}
+                        {can_('kick') && <button className="btn-ghost btn-sm !px-2" title="Vom Server werfen" onClick={() => setKickFor(p.user_id)}><LogOut size={14} /></button>}
+                        {isAdmin && can_('ban') && <button className="btn-danger btn-sm !px-2" title="Dauerhaft sperren" onClick={() => setBanFor(p.user_id)}><Ban size={14} /></button>}
                       </div>
                     </td>
                   )}

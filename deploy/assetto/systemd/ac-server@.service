@@ -1,0 +1,12 @@
+[Unit]
+Description=AssettoServer %i
+
+[Service]
+User=ac
+WorkingDirectory=/opt/assettoserver
+ExecStart=/opt/assettoserver/AssettoServer --preset %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

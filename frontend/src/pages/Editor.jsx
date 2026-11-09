@@ -33,7 +33,7 @@ function MetaSelect({ label, group, k, hint, form, set, meta }) {
   )
 }
 
-function Editor({ serverId = null, embedded = false, running = false }) {
+function Editor({ serverId = null, embedded = false, running = false, game = 'raceroom' }) {
   const nav = useNavigate()
   const toast = useToast()
   const [content, setContent] = useState(null)
@@ -51,7 +51,7 @@ function Editor({ serverId = null, embedded = false, running = false }) {
     let stop = false
     ;(async () => {
       try {
-        const [c, m] = await Promise.all([api('/api/content'), api('/api/meta')])
+        const [c, m] = await Promise.all([api(`/api/games/${game}/content`), api(`/api/games/${game}/meta`)])
         let f = { ...DEFAULT_FORM, experience: c.experiences[0]?.Id ?? 2481 }
         let tv = null
         if (serverId) { const sv = await api(`/api/servers/${serverId}`); f = fromServer(sv); tv = thumbSrc(sv) }
@@ -96,7 +96,7 @@ function Editor({ serverId = null, embedded = false, running = false }) {
 
   const save = async (andRestart = false) => {
     if (problems.length) { toast(problems[0], 'err'); return }
-    const payload = toPayload(form)
+    const payload = { ...toPayload(form), ...(serverId ? {} : { game }) }
     if (thumbNew !== null) payload.thumbnail = thumbNew
     if (serverId) {
       const r = await run(() => api(`/api/servers/${serverId}`, { method: 'PUT', body: payload }))

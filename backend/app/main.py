@@ -284,8 +284,8 @@ async def game_meta(game: str, _: User = Depends(require("viewer"))):
 
 
 @app.get("/api/games/{game}/schema")
-def game_schema(game: str, _: User = Depends(require("host"))):
-    return games.get(game).settings_schema()
+async def game_schema(game: str, _: User = Depends(require("host"))):
+    return await games.get(game).settings_schema()
 
 
 @app.get("/api/games/{game}/defaults")
