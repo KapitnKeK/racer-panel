@@ -1,8 +1,8 @@
-"""Live-Daten für das RaceRoom Panel.
+"""Live-Daten für das Racer Panel (spielübergreifend).
 
-* pollt den RaceRoom-Manager (alle 0,5-2 s) und baut einen Live-Snapshot
-* reichert Fahrer an (Name/Avatar über game.raceroom.com, Auto/Klasse aus dem Content)
-* berechnet Geschwindigkeit aus Positionssprüngen (Δ SessionTime des Servers)
+* fragt alle Spiel-Plugins ab (alle 0,5-2 s) und baut einen gemeinsamen Live-Snapshot
+* reichert Fahrer an (Name/Avatar über das Plugin, z. B. game.raceroom.com)
+* berechnet Geschwindigkeit aus Positionssprüngen, falls das Spiel sie nicht selbst liefert
 * schreibt einen Live-Feed (Beitritte, Vorfälle, Session-Wechsel, Start/Stopp)
 * lernt den Streckenumriss aus den tatsächlich gefahrenen X/Z-Punkten (pro Layout, SQLite)
 * liefert alles per Server-Sent Events (/api/live)
@@ -18,55 +18,43 @@ from collections import deque
 from typing import Any, Callable, Literal, Optional
 
 import httpx
-from . import geo_auto
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-
-def is_spectator(p: dict) -> bool:
-    """Zuschauer (z. B. der Broadcast-Bot) stehen in der Spielerliste ohne Auto: Position exakt 0/0, kein Ping."""
-    ping = p.get("LatestPingMilliSec")
-    return p.get("X") == 0 and p.get("Z") == 0 and (ping is None or ping < 0)
-
-
-def drivers_only(players: Optional[list]) -> list:
-    return [p for p in (players or []) if not is_spectator(p)]
+from . import games, geo_auto
 
 GRID = 3.0            # Meter pro Zelle des Streckenumrisses
 RECORD_MIN_KMH = 25.0  # darunter wird nicht aufgezeichnet (Box, Start, Stillstand)
 MAX_SEGMENT_M = 70.0   # längere Sprünge werden nicht interpoliert
 MAX_SUBSCRIBERS = 60
-SESSION_ORDER = ["Practice", "Qualify", "Warmup", "Race1", "Race2", "Race3"]
-SESSION_LABEL = {"Practice": "Training", "Qualify": "Qualifying", "Warmup": "Warm-up", "Race1": "Rennen 1", "Race2": "Rennen 2", "Race3": "Rennen 3"}
 
 
 class Live:
     def __init__(self, d: dict[str, Callable]):
         self.d = d
-        self.web = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "r3e-panel/1.0"}, follow_redirects=False)
-        self.sem = asyncio.Semaphore(3)
+        self.web = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "racer-panel/1.0"}, follow_redirects=False)
         self.subs: set[asyncio.Queue] = set()
-        self.snapshot: dict[str, Any] = {"ts": 0, "manager_ok": False, "servers": [], "names": {}}
+        self.snapshot: dict[str, Any] = {"ts": 0, "manager_ok": False, "servers": [], "names": {}, "games": {}}
         self._last_json = ""
         self.users: dict[int, dict] = {}          # Fahrer-Infos (Cache)
         self.retry: dict[int, float] = {}
         self.fetching: set[int] = set()
-        self.srv: dict[int, dict] = {}            # Zustand pro Server
-        self.pl: dict[tuple[int, int], dict] = {}  # Zustand pro (Server, Fahrer)
-        self.events: dict[int, deque] = {}
-        self.chat_ts: dict[int, float] = {}
-        self.chat: dict[int, list] = {}
-        self._idx_src: Any = None
-        self.liv: dict[int, tuple[dict, str]] = {}
-        self.classes: dict[int, str] = {}
-        self.layouts: dict[int, tuple[str, str]] = {}
+        self.srv: dict[str, dict] = {}            # Zustand pro Server (globale ID)
+        self.pl: dict[tuple[str, int], dict] = {}  # Zustand pro (Server, Fahrer)
+        self.events: dict[str, deque] = {}
+        self.chat_ts: dict[str, float] = {}
+        self.chat: dict[str, list] = {}
+        self.layouts: dict[int, tuple[str, str]] = {}   # alle Spiele: layout_id -> (Strecke, Layout)
         self.delta: dict[int, dict] = {}
         self.bot: dict[str, Any] = {"ts": 0}
         self.bot_cmd: Optional[dict] = None
+        self.bot_last: Optional[dict] = None   # letzter Regie-Befehl aus dem Panel
         self.bot_events: deque = deque(maxlen=50)
-        self.visits: dict[tuple[int, int], dict] = {}
+        self.visits: dict[tuple[str, int], dict] = {}
         self.visit_done: list[dict] = []
+        self.games_ok: dict[str, bool] = {}
+        self._srv_cache: dict[str, list] = {}           # letzter gültiger Stand pro Spiel
         self.stats = {"polls": 0, "errors": 0, "cells_written": 0}
 
     # ------------------------------------------------------------------ DB
@@ -79,6 +67,8 @@ class Live:
             c.execute("CREATE TABLE IF NOT EXISTS driver_cars(user_id INTEGER, car_id INTEGER, name TEXT, class TEXT, seconds REAL DEFAULT 0, PRIMARY KEY(user_id,car_id))")
             c.execute("CREATE TABLE IF NOT EXISTS driver_tracks(user_id INTEGER, layout_id INTEGER, seconds REAL DEFAULT 0, meters REAL DEFAULT 0, top_kmh REAL DEFAULT 0, PRIMARY KEY(user_id,layout_id))")
             c.execute("CREATE TABLE IF NOT EXISTS driver_visits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, server_name TEXT, layout_id INTEGER, car TEXT, start INTEGER, end INTEGER, seconds REAL, meters REAL, top_kmh REAL, incident_points INTEGER)")
+            if "game" not in [r["name"] for r in c.execute("PRAGMA table_info(driver_visits)")]:
+                c.execute("ALTER TABLE driver_visits ADD COLUMN game TEXT")
             c.execute("CREATE INDEX IF NOT EXISTS idx_visits_user ON driver_visits(user_id, start)")
             c.execute("CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS bot_results(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, data TEXT)")
@@ -98,36 +88,14 @@ class Live:
             )
 
     # ------------------------------------------------------------- Helfer
-    def _index(self, cdata: dict) -> None:
-        if self._idx_src is cdata:
-            return
-        self.liv = {}
-        for e in cdata["Liveries"]:
-            for l in e["Liveries"]:
-                self.liv[l["Id"]] = (e["Car"], l["Name"])
-        self.classes = {c["Id"]: c["Name"] for c in cdata["CarClasses"]}
-        self.layouts = {l["Id"]: (t["Name"], l["Name"]) for t in cdata["Tracks"] for l in t["Layouts"]}
-        self._idx_src = cdata
-
-    async def _fetch_user(self, uid: int) -> None:
+    async def _fetch_user(self, a: games.GameAdapter, uid: int) -> None:
         if uid in self.fetching or self.retry.get(uid, 0) > time.time():
             return
         self.fetching.add(uid)
         try:
-            async with self.sem:
-                r = await self.web.get(f"https://game.raceroom.com/utils/user-info/{uid}")
-            if r.status_code == 200:
-                j = r.json()
-                info = {
-                    "name": j.get("name") or j.get("username") or f"Fahrer {uid}",
-                    "username": j.get("username"),
-                    "team": j.get("team") or "",
-                    "avatar": j.get("avatar"),
-                    "banner": j.get("banner"),
-                    "vip": bool(j.get("vip")),
-                    "country": j.get("country") if isinstance(j.get("country"), dict) else None,
-                    "ts": int(time.time()),
-                }
+            info = await a.user_info(uid)
+            if info:
+                info.setdefault("game", a.key)
                 self.users[uid] = info
                 await asyncio.to_thread(self._save_user, uid, info)
             else:
@@ -141,83 +109,66 @@ class Live:
         with self.d["db"]() as c:
             c.execute("INSERT OR REPLACE INTO driver_cache(id,data,ts) VALUES(?,?,?)", (uid, json.dumps(info), int(time.time())))
 
-    def _event(self, sid: int, kind: str, text: str = "", user_id: Optional[int] = None, **extra: Any) -> None:
+    def _event(self, sid: str, kind: str, text: str = "", user_id: Optional[int] = None, **extra: Any) -> None:
         q = self.events.setdefault(sid, deque(maxlen=80))
         q.append({"ts": time.time(), "kind": kind, "text": text, "user_id": user_id, **extra})
 
-    def _session_label(self, gs: dict, idx: int) -> str:
-        tl = (gs.get("TrackLayouts") or [{}])[0]
-        sess = tl.get("Sessions", {})
-        active = []
-        for k in SESSION_ORDER:
-            if k == "Warmup":
-                if sess.get("WarmupDuration", 0) > 0:
-                    active.append(k)
-            elif k in sess and (sess[k].get("Duration", 0) > 0 or sess[k].get("Laps", 0) > 0):
-                active.append(k)
-        if 0 <= idx < len(active):
-            return SESSION_LABEL.get(active[idx], active[idx])
-        return f"Session {idx + 1}"
-
     # ------------------------------------------------------------ Polling
-    async def process(self, items: list[dict]) -> tuple[dict, list[tuple[int, int, int, float]]]:
-        cdata = await self.d["content"]()
-        self._index(cdata)
+    async def process(self, polled: list[tuple[games.GameAdapter, dict]]) -> tuple[dict, list[tuple[int, int, int, float]]]:
         now = time.time()
         servers: list[dict] = []
         cells: list[tuple[int, int, int, float]] = []
-        names_needed: set[int] = set()
+        names_needed: dict[int, games.GameAdapter] = {}
 
-        for item in items:
-            gs, ps = item["GameSetting"], item["ProcessState"]
-            sid = gs["Id"]
-            tl = (gs.get("TrackLayouts") or [{}])[0]
-            layout_id = tl.get("LayoutId")
+        for a, item in polled:
+            sid = games.gid(a.key, item["id"])
+            layout_id = item.get("layout_id")
+            running = bool(item["running"])
             st = self.srv.setdefault(sid, {"t_ms": None, "uids": None, "session": None, "running": None})
 
             # --- Server-Ereignisse
             if st["running"] is None:
-                st["running"] = ps["Running"]  # erster Blick: still übernehmen
-            elif ps["Running"] != st["running"]:
-                self._event(sid, "server", "Server gestartet" if ps["Running"] else "Server gestoppt")
-                st["running"] = ps["Running"]
+                st["running"] = running  # erster Blick: still übernehmen
+            elif running != st["running"]:
+                self._event(sid, "server", "Server gestartet" if running else "Server gestoppt")
+                st["running"] = running
                 st["t_ms"] = None
-                st["uids"] = set() if ps["Running"] else None
+                st["uids"] = set() if running else None
                 st["session"] = None
                 for k in [k for k in self.pl if k[0] == sid]:
                     self.pl.pop(k, None)
                 for k in [k for k in self.visits if k[0] == sid]:
                     self._end_visit(*k)
-            if ps["Running"] and st["session"] != ps["CurrentSession"]:
-                if st["session"] is not None and ps["PlayersOnServer"]:
-                    self._event(sid, "session", f"Neue Session: {self._session_label(gs, ps['CurrentSession'])}", session=ps["CurrentSession"])
-                st["session"] = ps["CurrentSession"]
+            if running and item.get("session") is not None and st["session"] != item["session"]:
+                if st["session"] is not None and item.get("has_players", bool(item["players"])):
+                    self._event(sid, "session", f"Neue Session: {item.get('session_label') or item['session'] + 1}", session=item["session"])
+                st["session"] = item["session"]
 
-            # --- Zeitbasis: Δ SessionTime des Servers; steht der still (z. B. 0), gilt der Report-Takt
-            t_ms = ps["SessionTime"]
-            interval = (gs.get("StateReportInterval") or 3000) / 1000.0
-            sig = tuple((q["UserId"], q["X"], q["Z"]) for q in drivers_only(ps.get("Players")))
-            ts_changed = bool(ps["Running"]) and st["t_ms"] != t_ms
-            pos_changed = bool(ps["Running"]) and st.get("sig") is not None and sig != st.get("sig")
+            # --- Zeitbasis: Δ Sessionzeit des Servers; steht die still (z. B. 0), gilt der Report-Takt
+            t_ms = item.get("session_time_ms")
+            interval = (item.get("report_ms") or 3000) / 1000.0
+            sig = tuple((q["uid"], q["x"], q["z"]) for q in item["players"])
+            ts_changed = running and t_ms is not None and st["t_ms"] != t_ms
+            pos_changed = running and st.get("sig") is not None and sig != st.get("sig")
             new_sample = ts_changed or pos_changed
             dt = None
             if ts_changed and st["t_ms"] is not None and 0.05 <= (t_ms - st["t_ms"]) / 1000.0 <= 15.0:
                 dt = (t_ms - st["t_ms"]) / 1000.0
             elif new_sample and st.get("sig") is not None:
                 dt = interval
-            if ps["Running"]:
+            if running:
                 st["t_ms"] = t_ms
                 st["sig"] = sig
             else:
                 st["sig"] = None
 
-            # --- Fahrer (Zuschauer wie der Broadcast-Bot ausblenden)
+            # --- Fahrer
             players = []
             uids_now: set[int] = set()
-            for p in drivers_only(ps.get("Players")):
-                uid = p["UserId"]
+            for p in item["players"]:
+                uid = int(p["uid"])
                 uids_now.add(uid)
-                x, z = p["X"], p["Z"]
+                x, z = p["x"], p["z"]
                 step = None
                 trk = self.pl.get((sid, uid))
                 if trk is None:
@@ -230,10 +181,13 @@ class Live:
                     if dist > 400:  # Teleport (Box/Neustart)
                         trk["kmh"] = 0.0
                     else:
-                        raw = dist / dt * 3.6
-                        if raw > 650:
-                            raw = trk["kmh"]
-                        trk["kmh"] = raw if trk["kmh"] is None else trk["kmh"] * 0.35 + raw * 0.65
+                        if p.get("kmh") is not None:   # Spiel liefert Tempo selbst
+                            trk["kmh"] = float(p["kmh"])
+                        else:
+                            raw = dist / dt * 3.6
+                            if raw > 650:
+                                raw = trk["kmh"]
+                            trk["kmh"] = raw if trk["kmh"] is None else trk["kmh"] * 0.35 + raw * 0.65
                         if dist > 0.3:
                             trk["hdg"] = math.degrees(math.atan2(dx, dz))
                         if layout_id and trk["kmh"] >= RECORD_MIN_KMH and dist > 0:
@@ -247,61 +201,58 @@ class Live:
                     trk["x"], trk["z"] = x, z
                 elif new_sample:
                     trk["x"], trk["z"] = x, z
+                    if p.get("kmh") is not None:
+                        trk["kmh"] = float(p["kmh"])
 
-                inc_pts = sum(i.get("Points", 0) for i in (p.get("Incidents") or []))
+                inc_pts = int(p.get("incident_points") or 0)
                 if trk["inc"] is not None and inc_pts > trk["inc"]:
                     self._event(sid, "incident", f"+{inc_pts - trk['inc']} Punkte", user_id=uid, total=inc_pts)
                 trk["inc"] = inc_pts
 
-                car, livery_name = self.liv.get(p["CarLiveryId"], (None, None))
+                car = (p["car_id"], p.get("car") or "?", p.get("class")) if p.get("car_id") is not None else None
                 if step:
-                    self._acc(uid, sid, gs, layout_id, p, trk["kmh"] or 0.0, car, step[1], step[0], inc_pts)
-                info = self.users.get(uid)
-                if info is None:
-                    names_needed.add(uid)
-                players.append(
-                    {
-                        "user_id": uid,
-                        "x": x,
-                        "z": z,
-                        "kmh": round(trk["kmh"] or 0.0, 1),
-                        "heading": None if trk["hdg"] is None else round(trk["hdg"], 1),
-                        "ping": round(p.get("LatestPingMilliSec") or 0.0, 1),
-                        "livery_id": p["CarLiveryId"],
-                        "car": car["Name"] if car else None,
-                        "car_id": car["Id"] if car else None,
-                        "class": self.classes.get(car["Class"]) if car else None,
-                        "livery": livery_name,
-                        "incident_points": inc_pts,
-                        "incidents": [{"type": i.get("Type"), "points": i.get("Points")} for i in (p.get("Incidents") or [])],
-                    }
-                )
+                    self._acc(uid, sid, a.key, item.get("server_name") or "?", layout_id, p, trk["kmh"] or 0.0, car, step[1], step[0], inc_pts)
+                if p.get("name") and (uid not in self.users or self.users[uid].get("name") != p["name"]):
+                    # Spiele ohne Profil-API (z. B. AC) liefern den Namen direkt
+                    info = {**self.users.get(uid, {}), "name": p["name"], "game": a.key, "ts": int(now)}
+                    self.users[uid] = info
+                    asyncio.create_task(asyncio.to_thread(self._save_user, uid, info))
+                elif uid not in self.users:
+                    names_needed[uid] = a
+                players.append({
+                    "user_id": uid, "x": x, "z": z,
+                    "kmh": round(trk["kmh"] or 0.0, 1),
+                    "heading": None if trk["hdg"] is None else round(trk["hdg"], 1),
+                    "ping": round(p.get("ping") or 0.0, 1),
+                    "livery_id": p.get("livery_id"), "car": p.get("car"), "car_id": p.get("car_id"),
+                    "class": p.get("class"), "livery": p.get("livery"),
+                    "incident_points": inc_pts, "incidents": p.get("incidents") or [],
+                })
 
             # --- Beitritte / Abgänge
-            if ps["Running"] and st["uids"] is not None:
+            if running and st["uids"] is not None:
                 for uid in uids_now - st["uids"]:
                     self._event(sid, "join", "ist beigetreten", user_id=uid)
                 for uid in st["uids"] - uids_now:
                     self._event(sid, "leave", "hat den Server verlassen", user_id=uid)
                     self.pl.pop((sid, uid), None)
                     self._end_visit(sid, uid)
-            st["uids"] = uids_now if ps["Running"] else None
+            st["uids"] = uids_now if running else None
 
-            view = self.d["to_view"](item, "viewer")
+            view = self.d["wrap"](a, dict(item["view"]))
+            view.setdefault("state", {})
             view["state"]["players"] = players
-            view["layout"] = {
-                "track": self.layouts.get(layout_id, ("?", "?"))[0],
-                "name": self.layouts.get(layout_id, ("?", "?"))[1],
-            }
-            view["state"]["session_label"] = self._session_label(gs, ps["CurrentSession"]) if ps["Running"] and ps["PlayersOnServer"] else None
-            view["state"]["time_left"] = ps.get("TimeLeft") if ps["Running"] else None
-            view["state_report_ms"] = gs.get("StateReportInterval", 3000)
+            tn, ln = self.layouts.get(layout_id, ("?", "?")) if layout_id else ("?", "?")
+            view["layout"] = {"track": tn, "name": ln}
+            view["state"]["session_label"] = item.get("session_label")
+            view["state"]["time_left"] = item.get("time_left")
+            view["state_report_ms"] = item.get("report_ms") or 3000
             view["events"] = list(self.events.get(sid, []))[-40:]
             view["chat"] = self.chat.get(sid, [])
             servers.append(view)
 
-        for uid in names_needed:
-            asyncio.create_task(self._fetch_user(uid))
+        for uid, a in names_needed.items():
+            asyncio.create_task(self._fetch_user(a, uid))
 
         used: set[int] = set()
         for s in servers:
@@ -312,26 +263,25 @@ class Live:
             for u in used
             if u in self.users
         }
-        snap = {"ts": now, "manager_ok": True, "servers": servers, "names": names}
+        snap = {"ts": now, "manager_ok": all(self.games_ok.values()) if self.games_ok else False, "games": dict(self.games_ok),
+                "servers": servers, "names": names}
         return snap, cells
 
     async def poll_chat(self, servers: list[dict]) -> None:
         now = time.time()
         for s in servers:
             sid = s["id"]
-            if not s["state"]["running"]:
+            a = games.get(s["game"])
+            if not s["state"]["running"] or "chat_read" not in a.caps:
                 self.chat.pop(sid, None)
                 continue
             if now - self.chat_ts.get(sid, 0) < 2.0:
                 continue
             self.chat_ts[sid] = now
             try:
-                res = await self.d["mgr"]("GET", f"/chat/{sid}")
-                msgs = res.get("messages", []) if isinstance(res, dict) else []
-                self.chat[sid] = [
-                    {"id": m.get("Id"), "ts": m.get("CreatedAt"), "user": m.get("UserName"), "text": m.get("Message")}
-                    for m in msgs[-60:]
-                ]
+                msgs = await a.poll_chat(str(s["native_id"]))
+                if msgs is not None:
+                    self.chat[sid] = msgs
             except Exception:
                 pass
 
@@ -354,23 +304,24 @@ class Live:
                 "flags": si.get("flagInfo") or {},
             })
         drivers.sort(key=lambda d: (d["pos"] if isinstance(d["pos"], int) and d["pos"] > 0 else 999))
-        return {"connected": True, "session": b.get("session"), "event": b.get("event"), "drivers": drivers, "events": list(self.bot_events)[-15:]}
+        return {"connected": True, "game": "raceroom", "focus": b.get("focus"), "last_cmd": self.bot_last, "session": b.get("session"), "event": b.get("event"), "drivers": drivers, "events": list(self.bot_events)[-15:]}
 
     # ------------------------------------------------------- Fahrer-Statistik
-    def _acc(self, uid: int, sid: int, gs: dict, layout_id: Optional[int], p: dict, kmh: float, car: Optional[dict], dt: float, dist: float, inc_pts: int) -> None:
+    def _acc(self, uid: int, sid: str, game: str, server_name: str, layout_id: Optional[int], p: dict, kmh: float,
+             car: Optional[tuple], dt: float, dist: float, inc_pts: int) -> None:
         now = int(time.time())
         d = self.delta.setdefault(uid, {"seconds": 0.0, "drive": 0.0, "meters": 0.0, "top": 0.0, "kmh_sum": 0.0, "kmh_n": 0, "ping_sum": 0.0, "ping_n": 0, "inc": 0, "visits": 0, "last": now, "cars": {}, "layouts": {}})
         v = self.visits.get((sid, uid))
         if v is None:
-            v = {"start": now, "server": gs.get("Name", "?"), "layout": layout_id, "car": car["Name"] if car else None, "seconds": 0.0, "meters": 0.0, "top": 0.0, "inc": 0, "uid": uid}
+            v = {"start": now, "server": server_name, "game": game, "layout": layout_id, "car": car[1] if car else None, "seconds": 0.0, "meters": 0.0, "top": 0.0, "inc": 0, "uid": uid}
             self.visits[(sid, uid)] = v
             d["visits"] += 1
         d["last"] = now
         d["seconds"] += dt
         v["seconds"] += dt
         if car:
-            v["car"] = car["Name"]
-            c = d["cars"].setdefault(car["Id"], {"name": car["Name"], "class": self.classes.get(car["Class"]), "seconds": 0.0})
+            v["car"] = car[1]
+            c = d["cars"].setdefault(car[0], {"name": car[1], "class": car[2], "seconds": 0.0})
             c["seconds"] += dt
         if layout_id:
             lay = d["layouts"].setdefault(layout_id, {"seconds": 0.0, "meters": 0.0, "top": 0.0})
@@ -384,14 +335,14 @@ class Live:
             if layout_id:
                 lay = d["layouts"][layout_id]
                 lay["meters"] += dist; lay["top"] = max(lay["top"], kmh)
-        ping = p.get("LatestPingMilliSec") or 0.0
+        ping = p.get("ping") or 0.0
         if ping > 0:
             d["ping_sum"] += ping; d["ping_n"] += 1
         if inc_pts > v["inc"]:
             d["inc"] += inc_pts - v["inc"]
         v["inc"] = max(v["inc"], inc_pts)
 
-    def _end_visit(self, sid: int, uid: int) -> None:
+    def _end_visit(self, sid: str, uid: int) -> None:
         v = self.visits.pop((sid, uid), None)
         if v and v["seconds"] >= 20:
             v["end"] = int(time.time())
@@ -414,15 +365,28 @@ class Live:
                     c.execute("INSERT INTO driver_tracks(user_id,layout_id,seconds,meters,top_kmh) VALUES(?,?,?,?,?) ON CONFLICT(user_id,layout_id) DO UPDATE SET seconds=seconds+excluded.seconds, meters=meters+excluded.meters, top_kmh=MAX(top_kmh,excluded.top_kmh)",
                               (uid, lid, lv["seconds"], lv["meters"], lv["top"]))
             for v in visits:
-                c.execute("INSERT INTO driver_visits(user_id,server_name,layout_id,car,start,end,seconds,meters,top_kmh,incident_points) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                          (v["uid"], v["server"], v["layout"], v["car"], v["start"], v["end"], v["seconds"], v["meters"], v["top"], v["inc"]))
+                c.execute("INSERT INTO driver_visits(user_id,server_name,layout_id,car,start,end,seconds,meters,top_kmh,incident_points,game) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                          (v["uid"], v["server"], v["layout"], v["car"], v["start"], v["end"], v["seconds"], v["meters"], v["top"], v["inc"], v.get("game")))
 
     # ------------------------------------------------- automatische Ausrichtung
-    def _tracks_overview(self, cdata: dict) -> dict[int, dict]:
+    async def tracks_overview(self) -> dict[int, dict]:
         out: dict[int, dict] = {}
-        for t in cdata["Tracks"]:
-            out[t["Id"]] = {"name": t["Name"], "layouts": [l["Id"] for l in t["Layouts"]]}
+        for a in games.all_adapters():
+            try:
+                out.update(await a.tracks())
+            except Exception:
+                continue
         return out
+
+    async def refresh_layouts(self) -> None:
+        names: dict[int, tuple[str, str]] = {}
+        for a in games.all_adapters():
+            try:
+                names.update(await a.layout_names())
+            except Exception:
+                continue
+        if names:
+            self.layouts = names
 
     def _cells_for(self, layout_ids: list[int]) -> list[tuple[float, float]]:
         if not layout_ids:
@@ -452,8 +416,7 @@ class Live:
         await asyncio.sleep(90)
         while True:
             try:
-                cdata = await self.d["content"]()
-                tracks = self._tracks_overview(cdata)
+                tracks = await self.tracks_overview()
                 with self.d["db"]() as c:
                     counts = {r["layout_id"]: r["n"] for r in c.execute("SELECT layout_id, COUNT(*) n FROM track_cells GROUP BY layout_id")}
                     have = {r["track_id"] for r in c.execute("SELECT track_id FROM track_geo")}
@@ -471,23 +434,31 @@ class Live:
                 pass
             await asyncio.sleep(600)
 
+    async def _poll_game(self, a: games.GameAdapter) -> list[tuple[games.GameAdapter, dict]]:
+        try:
+            items = await a.poll()
+            self.games_ok[a.key] = True
+            self._srv_cache[a.key] = items
+            return [(a, it) for it in items]
+        except Exception:
+            self.games_ok[a.key] = False
+            self.stats["errors"] += 1
+            # letzten Stand anzeigen, aber ohne Fahrer (sonst „stehen“ sie auf der Karte)
+            return [(a, {**it, "players": []}) for it in self._srv_cache.get(a.key, [])]
+
     async def run(self) -> None:
         asyncio.create_task(self.geo_loop())
+        last_layouts = 0.0
         while True:
             delay = 2.0
             try:
-                items = await self.d["mgr"]("GET", "/dedi/")
-                # Die Listenabfrage enthält keine Fahrer-Details; die gibt es nur pro Server
-                for it in items:
-                    ps = it["ProcessState"]
-                    if ps.get("Running") and ps.get("PlayersOnServer"):
-                        try:
-                            detail = await self.d["mgr"]("GET", f"/dedi/{it['GameSetting']['Id']}")
-                            if isinstance(detail, dict) and "ProcessState" in detail:
-                                it["ProcessState"] = detail["ProcessState"]
-                        except Exception:
-                            pass
-                snap, cells = await self.process(items)
+                if time.time() - last_layouts > 600 or not self.layouts:
+                    await self.refresh_layouts()
+                    last_layouts = time.time()
+                polled: list[tuple[games.GameAdapter, dict]] = []
+                for part in await asyncio.gather(*(self._poll_game(a) for a in games.all_adapters())):
+                    polled += part
+                snap, cells = await self.process(polled)
                 await self.poll_chat(snap["servers"])
                 for s in snap["servers"]:
                     s["chat"] = self.chat.get(s["id"], [])
@@ -503,11 +474,11 @@ class Live:
                 snap["bot"] = self.bot_view()
                 self.snapshot = snap
                 any_players = any(s["state"]["players"] for s in snap["servers"])
-                delay = 0.5 if any_players else 1.5
+                delay = 0.5 if any_players else (1.5 if snap["manager_ok"] else 5.0)
                 self._broadcast(snap)
-            except Exception as e:  # Manager nicht erreichbar etc.
+            except Exception as e:
                 self.stats["errors"] += 1
-                snap = {"ts": time.time(), "manager_ok": False, "servers": self.snapshot.get("servers", []), "names": self.snapshot.get("names", {}), "error": type(e).__name__}
+                snap = {"ts": time.time(), "manager_ok": False, "games": dict(self.games_ok), "servers": self.snapshot.get("servers", []), "names": self.snapshot.get("names", {}), "error": type(e).__name__}
                 self.snapshot = snap
                 self._broadcast(snap)
                 delay = 5.0
@@ -548,8 +519,8 @@ class WhitelistIn(BaseModel):
 
 
 class CameraIn(BaseModel):
-    slot: int = Field(..., ge=0, le=128)
-    camera: Literal["cockpit", "onboard", "onboard1", "onboard2", "nosecam", "swingman", "trackside", "frontCam", "rearCam", "wing", "exhaust"]
+    slot: int = Field(0, ge=0, le=128)
+    camera: Literal["auto", "cockpit", "onboard", "onboard1", "onboard2", "nosecam", "swingman", "trackside", "frontCam", "rearCam", "wing", "exhaust", "tv", "action", "heli", "static", "flFront", "frFront", "rlFront", "rlRear", "rrFront", "rrRear"]
 
 
 class BotCfgIn(BaseModel):
@@ -592,11 +563,17 @@ def setup(app, d: dict[str, Callable]) -> Live:
     hub = Live(d)
     hub.init_db()
     with d["db"]() as c:
-        c.execute("CREATE TABLE IF NOT EXISTS server_meta(server_id INTEGER PRIMARY KEY, stream_provider TEXT, stream_id TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS server_streams(server_id TEXT PRIMARY KEY, stream_provider TEXT, stream_id TEXT)")
+        # Migration aus dem RaceRoom-Panel: alte Zahl-IDs -> globale ID "raceroom-<id>"
+        if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_meta'").fetchone():
+            c.execute("INSERT OR IGNORE INTO server_streams(server_id,stream_provider,stream_id) SELECT 'raceroom-'||server_id, stream_provider, stream_id FROM server_meta")
     r = APIRouter()
     require = d["require"]
-    mgr = d["mgr"]
     audit = d["audit"]
+
+    def gsid(sid: str) -> tuple[games.GameAdapter, str, str]:
+        a, native = games.resolve(sid)
+        return a, native, games.gid(a.key, native)
 
     @app.on_event("startup")
     async def _start() -> None:  # noqa: D401
@@ -642,8 +619,8 @@ def setup(app, d: dict[str, Callable]) -> Live:
 
     @r.post("/api/tracks/{layout_id}/geo/auto")
     async def geo_auto_now(layout_id: int, body: AutoIn, user=Depends(require("admin"))):
-        cdata = await d["content"]()
-        info = next(((t["Id"], t["Name"], [l["Id"] for l in t["Layouts"]]) for t in cdata["Tracks"] if any(l["Id"] == layout_id for l in t["Layouts"])), None)
+        tracks = await hub.tracks_overview()
+        info = next(((tid, t["name"], t["layouts"]) for tid, t in tracks.items() if layout_id in t["layouts"]), None)
         if not info:
             raise HTTPException(404, "Unbekanntes Layout")
         hint = (body.hint_lat, body.hint_lon) if body.hint_lat is not None and body.hint_lon is not None else None
@@ -665,6 +642,12 @@ def setup(app, d: dict[str, Callable]) -> Live:
 
     def _info(uid: int) -> Optional[dict]:
         return hub.users.get(uid)
+
+    def _profile_url(info: dict) -> Optional[str]:
+        try:
+            return games.get(info.get("game") or "raceroom").profile_url(info)
+        except HTTPException:
+            return None
 
     @r.get("/api/drivers")
     def drivers(_=Depends(require("viewer"))):
@@ -689,7 +672,8 @@ def setup(app, d: dict[str, Callable]) -> Live:
         out.update({"cars": [{"name": x["name"], "class": x["class"], "seconds": round(x["seconds"])} for x in cars],
                     "tracks": [{"track": t["track"], "layout": t["layout"], "seconds": round(t["seconds"]), "meters": round(t["meters"]), "top_kmh": round(t["top_kmh"])} for t in tracks],
                     "visits": [{"server": v["server_name"], "track": v["track"], "layout": v["layout"], "car": v["car"], "start": v["start"], "end": v["end"], "seconds": round(v["seconds"]), "meters": round(v["meters"]), "top_kmh": round(v["top_kmh"]), "incident_points": v["incident_points"]} for v in visits],
-                    "profile_url": f"https://game.raceroom.com/users/{info['username']}" if info.get("username") else None,
+                    "profile_url": _profile_url(info),
+                    "game": info.get("game"),
                     "banner": info.get("banner")})
         return out
 
@@ -712,7 +696,8 @@ def setup(app, d: dict[str, Callable]) -> Live:
 
     def _check_bot(request: Request) -> None:
         import hmac as _h
-        if not _h.compare_digest(request.headers.get("x-bot-token", ""), _bot_token()):
+        # RaceRoom schreibt die -broadcastUrl in Kleinbuchstaben -> Token ohne Beachtung der Groß-/Kleinschreibung prüfen
+        if not _h.compare_digest(request.headers.get("x-bot-token", "").lower().encode(), _bot_token().lower().encode()):
             raise HTTPException(403, "Falscher Bot-Token")
 
     _BC_DIR = __import__("pathlib").Path(__file__).with_name("broadcast")
@@ -735,7 +720,8 @@ def setup(app, d: dict[str, Callable]) -> Live:
         if isinstance(drv, dict):  # GetDriversInfo liefert {"driversInfo": [...]}
             drv = drv.get("driversInfo")
         drv = [d for d in drv if isinstance(d, dict)][:64] if isinstance(drv, list) else []
-        hub.bot = {"ts": time.time(), "drivers": drv, "session": body.get("session"), "event": body.get("event")}
+        hub.bot = {"ts": time.time(), "drivers": drv, "session": body.get("session"), "event": body.get("event"),
+                   "focus": body.get("focus") if isinstance(body.get("focus"), int) else None}
         cmd, hub.bot_cmd = hub.bot_cmd, None
         return {"ok": True, "command": cmd}
 
@@ -758,6 +744,8 @@ def setup(app, d: dict[str, Callable]) -> Live:
     @r.post("/api/bot/camera")
     def bot_camera(body: CameraIn, user=Depends(require("host"))):
         hub.bot_cmd = {"slotId": body.slot, "camera": body.camera}
+        hub.bot_last = {"slot": body.slot, "camera": body.camera, "by": user.username, "ts": time.time()}
+        audit(user.username, "bot.camera", f"{body.camera} slot={body.slot}")
         return {"ok": True}
 
     @r.get("/api/bot/config")
@@ -797,114 +785,122 @@ def setup(app, d: dict[str, Callable]) -> Live:
         return {"ok": True}
 
     # ----------------------------------------------------------- Steuerung
-    async def _require_running(sid: int) -> dict:
-        items = await mgr("GET", "/dedi/")
-        cur = next((i for i in items if i["GameSetting"]["Id"] == sid), None)
-        if not cur:
-            raise HTTPException(404, "Server nicht gefunden")
-        if not cur["ProcessState"]["Running"]:
-            raise HTTPException(409, "Server läuft nicht")
-        return cur
-
     @r.post("/api/servers/{sid}/chat")
-    async def chat_send(sid: int, body: ChatIn, user=Depends(require("host"))):
-        await _require_running(sid)
-        await mgr("POST", f"/chat/{sid}/admin", {"Message": body.message.strip()})
-        audit(user.username, "chat.send", f"id={sid}: {body.message[:80]}")
-        hub.chat_ts[sid] = 0
+    async def chat_send(sid: str, body: ChatIn, user=Depends(require("host"))):
+        a, native, g = gsid(sid)
+        games.need(a, "chat", "Chat")
+        await a.chat(native, body.message.strip())
+        audit(user.username, "chat.send", f"id={g}: {body.message[:80]}")
+        hub.chat_ts[g] = 0
         return {"ok": True}
 
     @r.post("/api/servers/{sid}/session/{action}")
-    async def session_cmd(sid: int, action: Literal["restart", "next"], user=Depends(require("host"))):
-        await _require_running(sid)
-        await mgr("POST", f"/session/{sid}", {"Command": 1 if action == "restart" else 2})
-        audit(user.username, f"session.{action}", f"id={sid}")
+    async def session_cmd(sid: str, action: Literal["restart", "next"], user=Depends(require("host"))):
+        a, native, g = gsid(sid)
+        games.need(a, "session", "Session-Steuerung")
+        await a.session_cmd(native, action)
+        audit(user.username, f"session.{action}", f"id={g}")
         return {"ok": True}
 
     @r.post("/api/servers/{sid}/users/{uid}/kick")
-    async def kick(sid: int, uid: int, user=Depends(require("host"))):
-        await _require_running(sid)
-        await mgr("POST", "/user/kick", {"UserId": uid, "ProcessId": sid})
-        audit(user.username, "user.kick", f"server={sid} driver={uid}")
+    async def kick(sid: str, uid: int, user=Depends(require("host"))):
+        a, native, g = gsid(sid)
+        games.need(a, "kick", "Kicken")
+        await a.kick(native, uid)
+        audit(user.username, "user.kick", f"server={g} driver={uid}")
         return {"ok": True}
 
     @r.post("/api/servers/{sid}/users/{uid}/ban")
-    async def ban(sid: int, uid: int, user=Depends(require("admin"))):
-        await _require_running(sid)
-        await mgr("POST", "/user/ban", {"UserId": uid, "ProcessId": sid})
-        audit(user.username, "user.ban", f"server={sid} driver={uid}")
+    async def ban(sid: str, uid: int, user=Depends(require("admin"))):
+        a, native, g = gsid(sid)
+        games.need(a, "ban", "Sperren")
+        await a.ban(native, uid)
+        audit(user.username, "user.ban", f"server={g} driver={uid}")
         return {"ok": True}
 
     @r.post("/api/servers/{sid}/users/{uid}/penalty")
-    async def penalty(sid: int, uid: int, body: PenaltyIn, user=Depends(require("host"))):
-        await _require_running(sid)
-        payload: dict[str, Any] = {"UserId": uid, "ProcessId": sid, "PenaltyType": body.type}
-        if body.type == 0:
-            payload["Duration"] = body.duration
-        await mgr("POST", "/user/penalty", payload)
-        audit(user.username, "user.penalty", f"server={sid} driver={uid} type={body.type}")
+    async def penalty(sid: str, uid: int, body: PenaltyIn, user=Depends(require("host"))):
+        a, native, g = gsid(sid)
+        games.need(a, "penalty", "Strafen")
+        await a.penalty(native, uid, body.type, body.duration)
+        audit(user.username, "user.penalty", f"server={g} driver={uid} type={body.type}")
         return {"ok": True}
 
+    @r.get("/api/games/{game}/bans")
+    async def bans_game(game: str, _=Depends(require("host"))):
+        a = games.get(game)
+        games.need(a, "bans", "Sperrliste")
+        return {"users": await a.bans()}
+
+    @r.delete("/api/games/{game}/bans/{uid}")
+    async def unban_game(game: str, uid: int, user=Depends(require("admin"))):
+        a = games.get(game)
+        games.need(a, "bans", "Sperrliste")
+        await a.unban(uid)
+        audit(user.username, "ban.remove", f"{game}:{uid}")
+        return {"ok": True}
+
+    # Alte Pfade (RaceRoom)
     @r.get("/api/bans")
-    async def bans(_=Depends(require("host"))):
-        return {"users": await mgr("GET", "/ban")}
+    async def bans(user=Depends(require("host"))):
+        return await bans_game("raceroom", user)
 
     @r.delete("/api/bans/{uid}")
     async def unban(uid: int, user=Depends(require("admin"))):
-        await mgr("DELETE", "/ban", {"UserId": uid})
-        audit(user.username, "ban.remove", str(uid))
-        return {"ok": True}
+        return await unban_game("raceroom", uid, user)
 
     @r.get("/api/servers/{sid}/motd")
-    async def motd_get(sid: int, _=Depends(require("host"))):
-        res = await mgr("GET", f"/motd/{sid}")
-        return {"message": (res or {}).get("Message") or ""}
+    async def motd_get(sid: str, _=Depends(require("host"))):
+        a, native, _g = gsid(sid)
+        games.need(a, "motd", "Begrüßungsnachricht")
+        return {"message": await a.motd_get(native)}
 
     @r.put("/api/servers/{sid}/motd")
-    async def motd_set(sid: int, body: MotdIn, user=Depends(require("host"))):
-        await mgr("POST", "/motd/", {"ProcessId": sid, "Message": body.message.strip()})
-        audit(user.username, "motd.set", f"id={sid}")
+    async def motd_set(sid: str, body: MotdIn, user=Depends(require("host"))):
+        a, native, g = gsid(sid)
+        games.need(a, "motd", "Begrüßungsnachricht")
+        await a.motd_set(native, body.message.strip())
+        audit(user.username, "motd.set", f"id={g}")
         return {"ok": True}
 
     @r.get("/api/servers/{sid}/whitelist")
-    async def wl_get(sid: int, _=Depends(require("host"))):
-        res = await mgr("GET", f"/spectator-whitelist/{sid}")
-        return {"users": (res or {}).get("Users") or []}
+    async def wl_get(sid: str, _=Depends(require("host"))):
+        a, native, _g = gsid(sid)
+        games.need(a, "whitelist", "Zuschauer-Whitelist")
+        return {"users": await a.whitelist_get(native)}
 
     @r.put("/api/servers/{sid}/whitelist")
-    async def wl_set(sid: int, body: WhitelistIn, user=Depends(require("host"))):
-        await mgr("POST", "/spectator-whitelist", {"ProcessId": sid, "Users": body.users})
-        audit(user.username, "whitelist.set", f"id={sid} n={len(body.users)}")
+    async def wl_set(sid: str, body: WhitelistIn, user=Depends(require("host"))):
+        a, native, g = gsid(sid)
+        games.need(a, "whitelist", "Zuschauer-Whitelist")
+        await a.whitelist_set(native, body.users)
+        audit(user.username, "whitelist.set", f"id={g} n={len(body.users)}")
         return {"ok": True}
 
     @r.get("/api/servers/{sid}/stream")
-    def stream_get(sid: int, _=Depends(require("viewer"))):
+    def stream_get(sid: str, _=Depends(require("viewer"))):
+        _a, _n, g = gsid(sid)
         with d["db"]() as c:
-            row = c.execute("SELECT stream_provider,stream_id FROM server_meta WHERE server_id=?", (sid,)).fetchone()
+            row = c.execute("SELECT stream_provider,stream_id FROM server_streams WHERE server_id=?", (g,)).fetchone()
         if not row or not row["stream_provider"]:
             return {"stream": None}
         return {"stream": {"provider": row["stream_provider"], "id": row["stream_id"]}}
 
     @r.put("/api/servers/{sid}/stream")
-    def stream_set(sid: int, body: StreamIn, user=Depends(require("host"))):
+    def stream_set(sid: str, body: StreamIn, user=Depends(require("host"))):
+        _a, _n, g = gsid(sid)
         parsed = parse_stream(body.url)
         with d["db"]() as c:
             c.execute(
-                "INSERT INTO server_meta(server_id,stream_provider,stream_id) VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET stream_provider=excluded.stream_provider, stream_id=excluded.stream_id",
-                (sid, parsed["provider"] if parsed else None, parsed["id"] if parsed else None),
+                "INSERT INTO server_streams(server_id,stream_provider,stream_id) VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET stream_provider=excluded.stream_provider, stream_id=excluded.stream_id",
+                (g, parsed["provider"] if parsed else None, parsed["id"] if parsed else None),
             )
-        audit(user.username, "stream.set", f"id={sid} {parsed['provider'] if parsed else 'entfernt'}")
+        audit(user.username, "stream.set", f"id={g} {parsed['provider'] if parsed else 'entfernt'}")
         return {"stream": parsed}
-
-    _meta_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
     @r.get("/api/meta")
     async def meta(_=Depends(require("viewer"))):
-        if _meta_cache["data"] is None or time.time() - _meta_cache["ts"] > 3600:
-            raw = await mgr("GET", "/content/meta")
-            _meta_cache["data"] = {k: [{"value": o["Value"], "label": o["Label"]} for o in v] for k, v in raw.items() if isinstance(v, list)}
-            _meta_cache["ts"] = time.time()
-        return _meta_cache["data"]
+        return await games.resolve("0")[0].meta()
 
     app.include_router(r)
     return hub

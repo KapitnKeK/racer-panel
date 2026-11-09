@@ -1,7 +1,7 @@
-"""RaceRoom Panel — Backend.
+"""Racer Panel — Backend (Kern).
 
-Kapselt die API des RaceRoom "RR Dedicated manager" (nur per Host 'localhost:8088'
-erreichbar) und stellt sie mit Login, Rollen und sauberer Validierung bereit.
+Ein Panel für mehrere Rennspiel-Server. Login, Rollen, Audit, Live-Daten und Fahrer-Statistik
+liegen hier; alles Spielspezifische steckt in den Plugins unter ``app/games/<spiel>/``.
 """
 from __future__ import annotations
 
@@ -16,15 +16,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, Field, field_validator
 
-MANAGER_URL = os.environ.get("MANAGER_URL", "http://127.0.0.1:8088").rstrip("/")
-MANAGER_HOST_HEADER = os.environ.get("MANAGER_HOST_HEADER", "localhost:8088")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", "../frontend/dist"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "auto").lower()  # "1" immer, "0" nie, "auto" bei HTTPS
@@ -34,6 +31,7 @@ TRUSTED_PROXIES = {x.strip() for x in os.environ.get("TRUSTED_PROXIES", "").spli
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ROLES = {"viewer": 1, "host": 2, "admin": 3}
+CSRF_VALUES = ("racer-panel", "r3e-panel")  # alter Wert bleibt gültig (offene Browser-Tabs)
 
 
 # --------------------------------------------------------------------------- DB
@@ -107,7 +105,7 @@ def _secret() -> str:
 
 
 serializer = URLSafeTimedSerializer(_secret(), salt="r3e-panel-session")
-COOKIE = "r3e_session"
+COOKIE = "racer_session"
 
 _fails: dict[str, list[float]] = {}
 
@@ -169,318 +167,22 @@ def require(role: str):
     def dep(request: Request, user: User = Depends(current_user)) -> User:
         if ROLES[user.role] < ROLES[role]:
             raise HTTPException(403, "Dafür fehlt dir die Berechtigung")
-        if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("x-requested-with") != "r3e-panel":
+        if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("x-requested-with") not in CSRF_VALUES:
             raise HTTPException(403, "Ungültige Anfrage")
         return user
 
     return dep
 
 
-# --------------------------------------------------------------------- Manager
-class ManagerError(Exception):
-    pass
 
+# ------------------------------------------------------------------ Spiele
+from . import games  # noqa: E402
 
-_client: httpx.AsyncClient | None = None
-
-
-def client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            base_url=MANAGER_URL,
-            headers={"Host": MANAGER_HOST_HEADER},
-            timeout=httpx.Timeout(20.0, connect=5.0),
-        )
-    return _client
-
-
-async def mgr(method: str, path: str, json: Any = None) -> Any:
-    try:
-        r = await client().request(method, path, json=json)
-    except httpx.HTTPError as e:
-        raise HTTPException(502, f"RaceRoom-Manager nicht erreichbar ({type(e).__name__})")
-    if r.status_code >= 400:
-        raise HTTPException(502, f"RaceRoom-Manager meldet Fehler {r.status_code}")
-    if not r.content:
-        return None
-    try:
-        data = r.json()
-    except Exception:
-        raise HTTPException(502, "Ungültige Antwort vom RaceRoom-Manager")
-    if isinstance(data, dict) and len(data) == 1 and data.get("Message") and not path.startswith("/motd"):
-        raise HTTPException(502, f"RaceRoom-Manager: {data['Message']}")
-    return data
-
-
-_content_cache: dict[str, Any] = {"ts": 0, "data": None}
-
-
-async def content() -> dict:
-    if _content_cache["data"] is None or time.time() - _content_cache["ts"] > 600:
-        raw = await mgr("GET", "/content/all")
-        _content_cache["data"] = raw
-        _content_cache["ts"] = time.time()
-    return _content_cache["data"]
-
-
-# ------------------------------------------------------------------ Datenmodell
-SESSION_KEYS = ("Practice", "Qualify", "Race1", "Race2", "Race3")
-
-
-class SessionCfg(BaseModel):
-    duration: int = Field(10, ge=0, le=600, description="Minuten")
-    laps: int = Field(0, ge=0, le=500)
-    time_of_day: Optional[int] = Field(None, ge=0, le=4)  # 0 Dawn .. 4 Sunset
-    rolling_start: Optional[bool] = None
-
-
-class ServerSettings(BaseModel):
-    name: str = Field(..., min_length=1, max_length=40)
-    password: str = Field("", max_length=40)
-    experience: int
-    layout_id: int
-    car_ids: list[int] = Field(..., min_length=1, max_length=60)
-    max_players: int = Field(12, ge=1, le=64)
-    warmup: int = Field(0, ge=0, le=30)
-    sessions: dict[str, SessionCfg] = {}
-    time_multiplier: int = Field(0, ge=0, le=25)
-    drive_assist_preset: int = Field(0, ge=0, le=3)
-    assist_transmission: int = Field(-1, ge=-1, le=2)
-    assist_esp: int = Field(-1, ge=-1, le=3)
-    assist_steer: int = Field(-1, ge=-1, le=1)
-    assist_brake: int = Field(-1, ge=-1, le=3)
-    assist_traction: int = Field(-1, ge=-1, le=2)
-    assist_raceline: int = Field(-1, ge=-1, le=2)
-    assist_autopit: int = Field(-1, ge=-1, le=1)
-    fuel_usage: int = Field(0, ge=0, le=4)
-    tire_wear: int = Field(0, ge=0, le=4)
-    tire_temperature: int = Field(0, ge=0, le=1)
-    damage: int = Field(0, ge=0, le=2)
-    flag_rules: int = Field(0, ge=0, le=3)
-    cut_rules: int = Field(0, ge=0, le=3)
-    mandatory_pitstop: int = Field(0, ge=0, le=2)
-    prevent_false_start: int = Field(0, ge=0, le=1)
-    wrecker_prevention: int = Field(0, ge=0, le=1)
-    max_ping: int = Field(0, ge=0, le=450)
-    state_report_interval: int = Field(500, ge=250, le=3000)
-    race_finish_duration: int = Field(30, ge=30, le=600)
-    reverse_start_order_places: int = Field(0, ge=0, le=100)
-    stay_in_practice_if_empty: int = Field(0, ge=0, le=1)
-    allow_join_in_qualifying: int = Field(0, ge=0, le=1)
-    starting_grid_from_leaderboards: int = Field(0, ge=0, le=1)
-    checkered_after_time: int = Field(0, ge=0, le=600)
-    fixed_setup: int = Field(0, ge=0, le=1)
-    max_incident_points: int = Field(0, ge=0, le=1000)
-    min_rating: int = Field(0, ge=0, le=2100)
-    max_rating: int = Field(0, ge=0, le=2100)
-    min_reputation: int = Field(0, ge=0, le=100)
-    max_reputation: int = Field(0, ge=0, le=100)
-    non_ready_pitlane_start_delay: int = Field(0, ge=0, le=120)
-    thumbnail: Optional[str] = Field(None, max_length=600_000)  # None = unverändert, "" = entfernen, sonst Base64 (PNG/JPEG)
-
-    @field_validator("thumbnail")
-    @classmethod
-    def check_thumbnail(cls, v: Optional[str]) -> Optional[str]:
-        if v is None or v == "":
-            return v
-        import base64, binascii
-        try:
-            raw = base64.b64decode(v, validate=True)
-        except (binascii.Error, ValueError):
-            raise ValueError("Bild ist kein gültiges Base64")
-        if len(raw) > 400_000:
-            raise ValueError("Bild ist zu groß (max. 400 KB)")
-        if not (raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff")):
-            raise ValueError("Nur PNG oder JPEG erlaubt")
-        return v
-
-    @field_validator("name")
-    @classmethod
-    def clean_name(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Name fehlt")
-        return v
-
-    @field_validator("sessions")
-    @classmethod
-    def known_sessions(cls, v: dict) -> dict:
-        for k in v:
-            if k not in SESSION_KEYS:
-                raise ValueError(f"Unbekannte Session: {k}")
-        return v
-
-
-def liveries_for(cars: list[int], cdata: dict) -> list[int]:
-    out: list[int] = []
-    wanted = set(cars)
-    for entry in cdata["Liveries"]:
-        if entry["Car"]["Id"] in wanted:
-            out += [l["Id"] for l in entry["Liveries"]]
-    return out
-
-
-def apply_settings(gs: dict, s: ServerSettings, cdata: dict) -> dict:
-    """Schreibt die validierten Felder in ein (bestehendes) GameSetting."""
-    track_ok = any(l["Id"] == s.layout_id for t in cdata["Tracks"] for l in t["Layouts"])
-    if not track_ok:
-        raise HTTPException(422, "Unbekanntes Streckenlayout")
-    known_cars = {e["Car"]["Id"] for e in cdata["Liveries"]}
-    if any(c not in known_cars for c in s.car_ids):
-        raise HTTPException(422, "Unbekanntes Auto")
-    if s.experience not in {e["Id"] for e in cdata["Experiences"]}:
-        raise HTTPException(422, "Unbekannte Experience")
-
-    gs["Name"] = s.name
-    gs["Password"] = s.password
-    gs["Experience"] = s.experience
-    gs["MaxNumOfPlayers"] = s.max_players
-    gs["Cars"] = s.car_ids
-    gs["Liveries"] = liveries_for(s.car_ids, cdata)
-    gs["DriveAssistPreset"] = s.drive_assist_preset
-    gs["DriveAssistTransmission"] = s.assist_transmission
-    gs["DriveAssistEsp"] = s.assist_esp
-    gs["DriveAssistSteer"] = s.assist_steer
-    gs["DriveAssistBrake"] = s.assist_brake
-    gs["DriveAssistTractionControl"] = s.assist_traction
-    gs["DriveAssistRaceline"] = s.assist_raceline
-    gs["DriveAssistAutopit"] = s.assist_autopit
-    gs["FuelUsage"] = s.fuel_usage
-    gs["TireWear"] = s.tire_wear
-    gs["TireTemperature"] = s.tire_temperature
-    gs["Damage"] = s.damage
-    gs["FlagRules"] = s.flag_rules
-    gs["CutRules"] = s.cut_rules
-    gs["MandatoryPitstop"] = s.mandatory_pitstop
-    gs["PreventFalseStart"] = s.prevent_false_start
-    gs["WreckerPrevention"] = s.wrecker_prevention
-    gs["MaxPing"] = s.max_ping
-    gs["StateReportInterval"] = s.state_report_interval
-    gs["RaceFinishDuration"] = s.race_finish_duration
-    gs["ReverseStartOrderPlaces"] = s.reverse_start_order_places
-    gs["StayInPracticeSessionIfEmpty"] = s.stay_in_practice_if_empty
-    gs["AllowPlayersJoinInQualifying"] = s.allow_join_in_qualifying
-    gs["StartingGridFromLeaderboards"] = s.starting_grid_from_leaderboards
-    gs["CheckeredAfterTime"] = s.checkered_after_time
-    gs["FixedSetup"] = s.fixed_setup
-    gs["MaxIncidentPoints"] = s.max_incident_points
-    gs["MinRating"] = s.min_rating
-    gs["MaxRating"] = s.max_rating
-    gs["MinReputation"] = s.min_reputation
-    gs["MaxReputation"] = s.max_reputation
-    gs["NonReadyPitlaneStartDelay"] = s.non_ready_pitlane_start_delay
-    if s.thumbnail is not None:
-        gs["Thumbnail"] = s.thumbnail or None
-
-    tl = gs["TrackLayouts"][0] if gs.get("TrackLayouts") else {"EventPackId": 0, "Sessions": {}, "TimeOfDayMultiplier": 0}
-    tl["LayoutId"] = s.layout_id
-    tl["TimeOfDayMultiplier"] = s.time_multiplier
-    tl.setdefault("Sessions", {})
-    tl["Sessions"]["WarmupDuration"] = s.warmup
-    for key, cfg in s.sessions.items():
-        cur = tl["Sessions"].get(key) or {"SessionType": 1, "Clouds": None}
-        cur["Duration"] = cfg.duration
-        cur["Laps"] = cfg.laps
-        if cfg.time_of_day is not None:
-            cur["TimeOfDay"] = cfg.time_of_day
-        if cfg.rolling_start is not None:
-            # Rennen: 1 = Standing, 0 = Rolling; Training/Quali: 0 = Standing, 1 = Rolling
-            is_race = key.startswith("Race")
-            cur["SessionType"] = (0 if cfg.rolling_start else 1) if is_race else (1 if cfg.rolling_start else 0)
-        tl["Sessions"][key] = cur
-    gs["TrackLayouts"] = [tl]
-    return gs
-
-
-def to_view(item: dict, role: str) -> dict:
-    gs = item["GameSetting"]
-    ps = item["ProcessState"]
-    tl = (gs.get("TrackLayouts") or [{}])[0]
-    sess = tl.get("Sessions", {})
-    th = gs.get("Thumbnail")
-    if isinstance(th, str) and th.startswith("https://"):
-        thumb = {"kind": "url", "url": th}
-    elif isinstance(th, str) and th:
-        thumb = {"kind": "data", "v": hashlib.sha1(th.encode()).hexdigest()[:10]}
-    else:
-        thumb = None
-    view = {
-        "id": gs["Id"],
-        "name": gs["Name"],
-        "thumb": thumb,
-        "has_password": bool(gs.get("Password")),
-        "experience": gs["Experience"],
-        "layout_id": tl.get("LayoutId"),
-        "car_ids": gs.get("Cars", []),
-        "max_players": gs["MaxNumOfPlayers"],
-        "warmup": sess.get("WarmupDuration", 0),
-        "sessions": {
-            k: {
-                "duration": sess[k]["Duration"],
-                "laps": sess[k]["Laps"],
-                "time_of_day": sess[k]["TimeOfDay"],
-                "rolling_start": (sess[k].get("SessionType") == 0) if k.startswith("Race") else (sess[k].get("SessionType") == 1),
-            }
-            for k in SESSION_KEYS
-            if k in sess
-        },
-        "time_multiplier": tl.get("TimeOfDayMultiplier", 0),
-        "drive_assist_preset": gs.get("DriveAssistPreset", 0),
-        "assist_transmission": gs.get("DriveAssistTransmission", -1),
-        "assist_esp": gs.get("DriveAssistEsp", -1),
-        "assist_steer": gs.get("DriveAssistSteer", -1),
-        "assist_brake": gs.get("DriveAssistBrake", -1),
-        "assist_traction": gs.get("DriveAssistTractionControl", -1),
-        "assist_raceline": gs.get("DriveAssistRaceline", -1),
-        "assist_autopit": gs.get("DriveAssistAutopit", -1),
-        "fuel_usage": gs.get("FuelUsage", 0),
-        "tire_wear": gs.get("TireWear", 0),
-        "tire_temperature": gs.get("TireTemperature", 0),
-        "damage": gs.get("Damage", 0),
-        "flag_rules": gs.get("FlagRules", 0),
-        "cut_rules": gs.get("CutRules", 0),
-        "mandatory_pitstop": gs.get("MandatoryPitstop", 0),
-        "prevent_false_start": gs.get("PreventFalseStart", 0),
-        "wrecker_prevention": gs.get("WreckerPrevention", 0),
-        "max_ping": gs.get("MaxPing", 0),
-        "state_report_interval": gs.get("StateReportInterval", 3000),
-        "race_finish_duration": gs.get("RaceFinishDuration", 30),
-        "reverse_start_order_places": gs.get("ReverseStartOrderPlaces", 0),
-        "stay_in_practice_if_empty": gs.get("StayInPracticeSessionIfEmpty", 0),
-        "allow_join_in_qualifying": gs.get("AllowPlayersJoinInQualifying", 0),
-        "starting_grid_from_leaderboards": gs.get("StartingGridFromLeaderboards", 0),
-        "checkered_after_time": gs.get("CheckeredAfterTime", 0),
-        "fixed_setup": gs.get("FixedSetup", 0),
-        "max_incident_points": gs.get("MaxIncidentPoints", 0),
-        "min_rating": gs.get("MinRating", 0),
-        "max_rating": gs.get("MaxRating", 0),
-        "min_reputation": gs.get("MinReputation", 0),
-        "max_reputation": gs.get("MaxReputation", 0),
-        "non_ready_pitlane_start_delay": gs.get("NonReadyPitlaneStartDelay", 0),
-        "state": {
-            "running": ps["Running"],
-            "port": ps["Port"],
-            "time_port": ps["TimePort"],
-            "players_online": ps["PlayersOnServer"],
-            "session": ps["CurrentSession"],
-            "session_time": ps["SessionTime"],
-            "session_time_left": ps["SessionTimeLeft"],
-            "players": [
-                {"name": p.get("Name") or p.get("UserName") or "?", "raw": p}
-                for p in (ps.get("Players") or [])
-                # Zuschauer (Broadcast-Bot) ohne Auto: Position 0/0, kein Ping
-                if not (p.get("X") == 0 and p.get("Z") == 0 and (p.get("LatestPingMilliSec") is None or p["LatestPingMilliSec"] < 0))
-            ],
-        },
-    }
-    if ROLES[role] >= ROLES["host"]:
-        view["password"] = gs.get("Password", "")
-    return view
+games.load({"db": db, "audit": audit})
 
 
 # -------------------------------------------------------------------------- App
-app = FastAPI(title="RaceRoom Panel", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Racer Panel", docs_url=None, redoc_url=None, openapi_url=None)
 init_db()
 
 
@@ -548,44 +250,80 @@ def me(user: User = Depends(current_user)):
 
 @app.get("/api/health")
 async def health():
-    try:
-        r = await client().get("/")
-        return {"panel": True, "manager": r.status_code == 200}
-    except httpx.HTTPError:
-        return {"panel": True, "manager": False}
+    out = {"panel": True, "games": {}}
+    for a in games.all_adapters():
+        out["games"][a.key] = await a.health()
+    out["manager"] = all(out["games"].values())  # Abwärtskompatibel
+    return out
 
 
+# ------------------------------------------------------------------- Spiele
+def wrap(a: games.GameAdapter, view: dict) -> dict:
+    """Spiel-Ansicht um globale ID, Spiel und Fähigkeiten ergänzen."""
+    native = view["id"]
+    view["native_id"] = native
+    view["id"] = games.gid(a.key, native)
+    view["game"] = a.key
+    view["caps"] = sorted(a.caps)
+    return view
+
+
+@app.get("/api/games")
+def list_games(_: User = Depends(require("viewer"))):
+    return [a.info() for a in games.all_adapters()]
+
+
+@app.get("/api/games/{game}/content")
+async def game_content(game: str, _: User = Depends(require("viewer"))):
+    return await games.get(game).content()
+
+
+@app.get("/api/games/{game}/meta")
+async def game_meta(game: str, _: User = Depends(require("viewer"))):
+    return await games.get(game).meta()
+
+
+@app.get("/api/games/{game}/schema")
+def game_schema(game: str, _: User = Depends(require("host"))):
+    return games.get(game).settings_schema()
+
+
+@app.get("/api/games/{game}/defaults")
+async def game_defaults(game: str, _: User = Depends(require("host"))):
+    return await games.get(game).defaults()
+
+
+# Alte Pfade (RaceRoom-Panel) bleiben gültig
 @app.get("/api/content")
 async def get_content(_: User = Depends(require("viewer"))):
-    c = await content()
-    return {
-        "experiences": c["Experiences"],
-        "car_classes": c["CarClasses"],
-        "tracks": [
-            {"id": t["Id"], "name": t["Name"], "layouts": [{"id": l["Id"], "name": l["Name"], "experiences": l["Experiences"], "max": l["MaxVehicles"]} for l in t["Layouts"]]}
-            for t in sorted(c["Tracks"], key=lambda t: t["Name"].lower())
-        ],
-        "cars": [
-            {"id": e["Car"]["Id"], "name": e["Car"]["Name"], "class": e["Car"]["Class"], "experiences": e["Car"]["Experiences"], "liveries": len(e["Liveries"])}
-            for e in sorted(c["Liveries"], key=lambda e: e["Car"]["Name"].lower())
-        ],
-    }
+    return await games.resolve("0")[0].content()
 
 
-def _track_of_layout(cdata: dict, layout_id: int) -> Optional[int]:
-    for t in cdata["Tracks"]:
-        if any(l["Id"] == layout_id for l in t["Layouts"]):
-            return t["Id"]
-    return None
+@app.get("/api/defaults")
+async def defaults(_: User = Depends(require("host"))):
+    return await games.resolve("0")[0].defaults()
+
+
+# ----------------------------------------------------------------- Strecken
+async def layout_index() -> dict[int, tuple[int, str, list[int]]]:
+    """{layout_id: (track_id, Streckenname, [alle layout_ids der Strecke])} über alle Spiele."""
+    out: dict[int, tuple[int, str, list[int]]] = {}
+    for a in games.all_adapters():
+        try:
+            for tid, t in (await a.tracks()).items():
+                for lid in t["layouts"]:
+                    out[lid] = (tid, t["name"], t["layouts"])
+        except HTTPException:
+            continue
+    return out
 
 
 @app.get("/api/tracks/{layout_id}/geo")
 async def get_geo(layout_id: int, _: User = Depends(require("viewer"))):
-    tid = _track_of_layout(await content(), layout_id)
-    if tid is None:
+    hit = (await layout_index()).get(layout_id)
+    if not hit:
         raise HTTPException(404, "Unbekanntes Layout")
-    cd = await content()
-    lids = next(([l["Id"] for l in t["Layouts"]] for t in cd["Tracks"] if t["Id"] == tid), [])
+    tid, _name, lids = hit
     with db() as c:
         r = c.execute("SELECT * FROM track_geo WHERE track_id=?", (tid,)).fetchone()
         n = c.execute(f"SELECT COUNT(*) n FROM track_cells WHERE layout_id IN ({','.join(str(int(i)) for i in lids) or '0'})").fetchone()["n"]
@@ -605,9 +343,10 @@ class GeoIn(BaseModel):
 
 @app.put("/api/tracks/{layout_id}/geo")
 async def put_geo(layout_id: int, body: GeoIn, user: User = Depends(require("admin"))):
-    tid = _track_of_layout(await content(), layout_id)
-    if tid is None:
+    hit = (await layout_index()).get(layout_id)
+    if not hit:
         raise HTTPException(404, "Unbekanntes Layout")
+    tid = hit[0]
     with db() as c:
         c.execute("INSERT INTO track_geo(track_id,lat0,lon0,rot_deg,mirror,source) VALUES(?,?,?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET lat0=excluded.lat0, lon0=excluded.lon0, rot_deg=excluded.rot_deg, mirror=excluded.mirror, source=excluded.source",
                   (tid, body.lat0, body.lon0, body.rot_deg, int(body.mirror), f"manuell von {user.username}"))
@@ -615,95 +354,80 @@ async def put_geo(layout_id: int, body: GeoIn, user: User = Depends(require("adm
     return {"ok": True}
 
 
+# ------------------------------------------------------------------- Server
 @app.get("/api/servers")
 async def list_servers(user: User = Depends(require("viewer"))):
-    data = await mgr("GET", "/dedi/")
-    return [to_view(i, user.role) for i in data]
+    out = []
+    for a in games.all_adapters():
+        try:
+            out += [wrap(a, v) for v in await a.list_servers(user.role)]
+        except HTTPException:
+            continue  # ein Spiel-Host offline darf die Liste nicht leeren
+    return out
 
 
 @app.get("/api/servers/{sid}/thumbnail")
-async def get_thumbnail(sid: int, _: User = Depends(require("viewer"))):
-    import base64
-    for i in await mgr("GET", "/dedi/"):
-        if i["GameSetting"]["Id"] == sid:
-            th = i["GameSetting"].get("Thumbnail")
-            if isinstance(th, str) and th and not th.startswith("http"):
-                try:
-                    raw = base64.b64decode(th)
-                except Exception:
-                    break
-                mt = "image/png" if raw.startswith(b"\x89PNG") else "image/jpeg"
-                return Response(raw, media_type=mt, headers={"Cache-Control": "private, max-age=86400"})
-            break
-    raise HTTPException(404, "Kein Bild")
+async def get_thumbnail(sid: str, _: User = Depends(require("viewer"))):
+    a, native = games.resolve(sid)
+    res = await a.thumbnail(native)
+    if not res:
+        raise HTTPException(404, "Kein Bild")
+    raw, mt = res
+    return Response(raw, media_type=mt, headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.get("/api/servers/{sid}")
-async def get_server(sid: int, user: User = Depends(require("viewer"))):
-    for i in await mgr("GET", "/dedi/"):
-        if i["GameSetting"]["Id"] == sid:
-            return to_view(i, user.role)
-    raise HTTPException(404, "Server nicht gefunden")
-
-
-@app.get("/api/defaults")
-async def defaults(_: User = Depends(require("host"))):
-    d = await mgr("GET", "/dedi/default")
-    c = await content()
-    first_car = c["Liveries"][0]["Car"]["Id"] if c["Liveries"] else None
-    return {"max_players": d["GameSetting"]["MaxNumOfPlayers"], "experience": d["GameSetting"]["Experience"], "first_car": first_car}
+async def get_server(sid: str, user: User = Depends(require("viewer"))):
+    a, native = games.resolve(sid)
+    return wrap(a, await a.get_server(native, user.role))
 
 
 @app.post("/api/servers")
-async def create_server(body: ServerSettings, user: User = Depends(require("host"))):
-    base = (await mgr("GET", "/dedi/default"))["GameSetting"]
-    gs = apply_settings(base, body, await content())
-    res = await mgr("POST", "/dedi/", {"GameSettings": gs})
-    audit(user.username, "server.create", f"{body.name} id={res.get('ProcessId')}")
-    return {"id": res.get("ProcessId")}
+async def create_server(body: dict, user: User = Depends(require("host"))):
+    key = body.pop("game", None) or games.default().key
+    a = games.get(str(key))
+    games.need(a, "create", "Anlegen")
+    native = await a.create(body)
+    sid = games.gid(a.key, native)
+    audit(user.username, "server.create", f"{str(body.get('name', ''))[:40]} id={sid}")
+    return {"id": sid}
 
 
 @app.put("/api/servers/{sid}")
-async def update_server(sid: int, body: ServerSettings, user: User = Depends(require("host"))):
-    items = await mgr("GET", "/dedi/")
-    cur = next((i for i in items if i["GameSetting"]["Id"] == sid), None)
-    if not cur:
-        raise HTTPException(404, "Server nicht gefunden")
-    gs = apply_settings(cur["GameSetting"], body, await content())
-    gs["Id"] = sid
-    await mgr("POST", "/dedi/", {"GameSettings": gs})
-    audit(user.username, "server.update", f"{body.name} id={sid}")
-    return {"id": sid, "restart_needed": bool(cur["ProcessState"]["Running"])}
-
-
-class Action(BaseModel):
-    pass
+async def update_server(sid: str, body: dict, user: User = Depends(require("host"))):
+    a, native = games.resolve(sid)
+    games.need(a, "edit", "Bearbeiten")
+    body.pop("game", None)
+    res = await a.update(native, body)
+    gid = games.gid(a.key, native)
+    audit(user.username, "server.update", f"{res.get('name', '')} id={gid}")
+    return {"id": gid, "restart_needed": res.get("restart_needed", False)}
 
 
 @app.post("/api/servers/{sid}/start")
-async def start_server(sid: int, user: User = Depends(require("host"))):
-    res = await mgr("POST", "/dedi/start", {"ProcessId": sid})
-    audit(user.username, "server.start", f"id={sid}")
+async def start_server(sid: str, user: User = Depends(require("host"))):
+    a, native = games.resolve(sid)
+    games.need(a, "start", "Starten")
+    res = await a.start(native)
+    audit(user.username, "server.start", f"id={games.gid(a.key, native)}")
     return res
 
 
 @app.post("/api/servers/{sid}/stop")
-async def stop_server(sid: int, user: User = Depends(require("host"))):
-    res = await mgr("POST", "/dedi/stop", {"ProcessId": sid})
-    audit(user.username, "server.stop", f"id={sid}")
+async def stop_server(sid: str, user: User = Depends(require("host"))):
+    a, native = games.resolve(sid)
+    games.need(a, "stop", "Stoppen")
+    res = await a.stop(native)
+    audit(user.username, "server.stop", f"id={games.gid(a.key, native)}")
     return res
 
 
 @app.delete("/api/servers/{sid}")
-async def delete_server(sid: int, user: User = Depends(require("admin"))):
-    items = await mgr("GET", "/dedi/")
-    cur = next((i for i in items if i["GameSetting"]["Id"] == sid), None)
-    if not cur:
-        raise HTTPException(404, "Server nicht gefunden")
-    if cur["ProcessState"]["Running"]:
-        raise HTTPException(409, "Server läuft noch, bitte zuerst stoppen")
-    await mgr("DELETE", f"/dedi/{sid}")
-    audit(user.username, "server.delete", f"id={sid}")
+async def delete_server(sid: str, user: User = Depends(require("admin"))):
+    a, native = games.resolve(sid)
+    games.need(a, "delete", "Löschen")
+    await a.delete(native)
+    audit(user.username, "server.delete", f"id={games.gid(a.key, native)}")
     return {"ok": True}
 
 
@@ -776,7 +500,7 @@ def get_audit(_: User = Depends(require("admin"))):
 # ------------------------------------------------------------------ Live-Modul
 from . import live as _live  # noqa: E402
 
-hub = _live.setup(app, {"db": db, "content": content, "mgr": mgr, "require": require, "audit": audit, "to_view": to_view})
+hub = _live.setup(app, {"db": db, "require": require, "audit": audit, "wrap": wrap})
 
 
 # ------------------------------------------------------------------- Frontend
